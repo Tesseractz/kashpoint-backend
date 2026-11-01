@@ -23,7 +23,6 @@ os.environ["SUPABASE_URL"] = "https://test.supabase.co"
 os.environ["SUPABASE_SERVICE_ROLE_KEY"] = "test-service-role-key"
 os.environ["SUPABASE_JWT_SECRET"] = "test-jwt-secret-key-for-testing-only"
 os.environ["PAYSTACK_SECRET_KEY_TEST"] = "sk_test_fake_paystack"
-os.environ["PAYSTACK_PLAN_CODE_NO_TRIAL_TEST"] = "PLAN_NO_TRIAL_TEST"
 os.environ["PAYSTACK_MODE"] = "test"
 os.environ["PASSWORD_ENCRYPTION_KEY"] = "dGVzdC1lbmNyeXB0aW9uLWtleS0xMjM0NTY3ODkw"
 

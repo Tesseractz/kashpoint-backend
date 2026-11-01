@@ -37,11 +37,6 @@ def get_paystack_plan_code() -> str:
     return _get("PLAN_CODE")
 
 
-def get_paystack_plan_code_no_trial() -> str:
-    """Plan without trial — used after this store has used its one-month trial."""
-    return _get("PLAN_CODE_NO_TRIAL")
-
-
 def verify_paystack_signature(raw_body: bytes, signature: Optional[str]) -> bool:
     """Return True iff the signature is a valid Paystack HMAC-SHA512 of raw_body.
 
@@ -85,7 +80,6 @@ def initialize_transaction(
     amount_kobo: int,
     callback_url: str,
     metadata: dict,
-    plan_code: Optional[str] = None,
 ) -> Dict[str, str]:
     """Create a Paystack hosted payment page.
 
@@ -93,15 +87,12 @@ def initialize_transaction(
     The reference is what /billing/paystack/sync uses to verify the
     transaction directly with Paystack — required for the mobile flow
     where we can't read the callback URL.
-
-    plan_code overrides the default plan (used for the no-trial variant
-    after a store has consumed its one-time trial).
     """
     secret = get_paystack_secret_key()
     if not secret:
         raise Exception("Missing PAYSTACK_SECRET_KEY")
 
-    pc = (plan_code or "").strip() or get_paystack_plan_code()
+    pc = get_paystack_plan_code()
     if not pc:
         raise Exception("Missing PAYSTACK_PLAN_CODE")
 

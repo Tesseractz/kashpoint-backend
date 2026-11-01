@@ -257,41 +257,6 @@ class TestGetStorePlan:
             assert limits.status == "active"
             assert limits.is_active == True
 
-    def test_get_store_plan_maps_trialing_to_active_when_trial_already_consumed(self):
-        """Paystack may still send trialing after resubscribe; app must not grant a second trial."""
-        os.environ.pop("DEV_PLAN_OVERRIDE", None)
-        os.environ["DEV_PLAN_OVERRIDE"] = ""
-
-        import importlib
-        import app.services.subscriptions
-
-        importlib.reload(app.services.subscriptions)
-
-        with patch("app.services.subscriptions.get_supabase_client") as mock_get_supabase:
-            from app.services.subscriptions import get_store_plan
-            from datetime import datetime, timedelta, timezone
-
-            trial_end = (datetime.now(timezone.utc) + timedelta(days=10)).isoformat()
-            mock_supabase = MagicMock()
-            mock_query = MagicMock()
-            mock_query.execute.return_value.data = {
-                "plan": "pro",
-                "status": "trialing",
-                "trial_end": trial_end,
-                "trial_consumed_at": "2026-01-01T00:00:00Z",
-            }
-            mock_query.select.return_value = mock_query
-            mock_query.eq.return_value = mock_query
-            mock_query.single.return_value = mock_query
-            mock_supabase.table.return_value = mock_query
-            mock_get_supabase.return_value = mock_supabase
-
-            limits = get_store_plan("test-store-id")
-
-            assert limits.status == "active"
-            assert limits.is_on_trial is False
-            assert limits.is_active is True
-
     def test_get_store_plan_fails_open_on_error(self):
         """A database error must fail open, not read as an expired plan.
 

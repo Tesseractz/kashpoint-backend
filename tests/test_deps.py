@@ -105,7 +105,17 @@ class TestCreateStoreAndProfile:
         
         assert result["id"] == "user-123"
         assert result["role"] == "admin"
-    
+
+        # A brand-new store starts on a real 30-day Pro trial, no card required.
+        from datetime import datetime, timedelta, timezone
+
+        inserted = mock_sub_insert.insert.call_args[0][0]
+        assert inserted["store_id"] == "new-store-id"
+        assert inserted["plan"] == "pro"
+        assert inserted["status"] == "trialing"
+        remaining = datetime.fromisoformat(inserted["trial_end"]) - datetime.now(timezone.utc)
+        assert timedelta(days=29, hours=23) < remaining <= timedelta(days=30)
+
     def test_reuses_existing_store(self):
         """Test that existing store is reused."""
         from app.api.deps import _create_store_and_profile

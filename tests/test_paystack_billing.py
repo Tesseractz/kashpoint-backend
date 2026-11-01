@@ -59,23 +59,7 @@ def test_paystack_checkout_returns_authorization_url(mock_init_tx, mock_supa, cl
     assert resp.status_code == 200
     assert resp.json()["url"].startswith("https://")
     mock_init_tx.assert_called_once()
-    assert mock_init_tx.call_args.kwargs.get("plan_code") in (None, "")
-
-
-@patch("app.db.supabase.get_supabase_client")
-@patch("app.clients.paystack.initialize_transaction")
-def test_paystack_checkout_uses_no_trial_plan_when_trial_already_consumed(mock_init_tx, mock_supa, client, monkeypatch):
-    monkeypatch.setenv("BILLING_PROVIDER", "paystack")
-    monkeypatch.setenv("PAYSTACK_PLAN_CODE_NO_TRIAL_TEST", "PLAN_NO_TRIAL_X")
-    mock_supa.return_value.table.return_value = _subscription_select_chain_mock("2026-01-01T00:00:00Z")
-    mock_init_tx.return_value = {
-        "url": "https://checkout.paystack.com/abc",
-        "reference": "ref_test_abc",
-    }
-
-    resp = client.post("/billing/checkout", json={"plan": "pro", "email": "a@b.com"})
-    assert resp.status_code == 200
-    assert mock_init_tx.call_args.kwargs["plan_code"] == "PLAN_NO_TRIAL_X"
+    assert "plan_code" not in mock_init_tx.call_args.kwargs
 
 
 @patch("app.core.http_config.allowed_origins", ["*"])
@@ -185,6 +169,94 @@ def test_paystack_webhook_charge_success_upserts_subscription(mock_supa, client,
     subs_table = mock_client.table.return_value
     upsert_calls = [c for c in subs_table.upsert.call_args_list]
     assert any((c.args and c.args[0].get("status") == "active") for c in upsert_calls)
+
+
+def _supa_with_customer_row(row):
+    """Supabase mock whose subscriptions table resolves a customer-code lookup to `row`."""
+    subs = MagicMock()
+    subs.select.return_value.eq.return_value.limit.return_value.execute.return_value = MagicMock(
+        data=[row] if row else []
+    )
+    subs.select.return_value.eq.return_value.single.return_value.execute.return_value = MagicMock(data={})
+    client = MagicMock()
+    client.table.side_effect = lambda name: subs if name == "subscriptions" else MagicMock()
+    return client, subs
+
+
+@patch("app.db.supabase.get_supabase_client")
+def test_webhook_subscription_create_without_metadata_resolves_store_by_customer(mock_supa, client, monkeypatch):
+    """Paystack's subscription.* events carry no metadata: the customer code
+    recorded at checkout is the only link back to the store."""
+    monkeypatch.setenv("PAYSTACK_MODE", "test")
+    monkeypatch.setenv("PAYSTACK_SECRET_KEY_TEST", "sk_test_x")
+    mock_client, subs = _supa_with_customer_row({"store_id": "store_1", "paystack_subscription_code": None})
+    mock_supa.return_value = mock_client
+
+    payload = {
+        "event": "subscription.create",
+        "data": {
+            "id": 555,
+            "customer": {"customer_code": "CUS_x"},
+            "subscription_code": "SUB_new",
+            "email_token": "EMT_new",
+            "next_payment_date": "2026-12-01T00:00:00.000Z",
+        },
+    }
+    raw = json.dumps(payload).encode("utf-8")
+    resp = client.post("/paystack/webhook", content=raw, headers={"x-paystack-signature": _sign("sk_test_x", raw)})
+    assert resp.status_code == 200, resp.text
+
+    upserted = subs.upsert.call_args[0][0]
+    assert upserted["store_id"] == "store_1"
+    assert upserted["status"] == "active"
+    assert upserted["paystack_subscription_code"] == "SUB_new"
+    assert upserted["paystack_email_token"] == "EMT_new"
+    assert upserted["current_period_end"] == "2026-12-01T00:00:00.000Z"
+
+
+@patch("app.clients.paystack.fetch_subscription_by_code")
+@patch("app.db.supabase.get_supabase_client")
+def test_webhook_renewal_charge_without_metadata_advances_period_end(mock_supa, mock_fetch, client, monkeypatch):
+    """Monthly renewals are charges Paystack raises itself: no metadata and no
+    subscription object. The stored subscription code must drive the refresh,
+    or a paying store's paid-through date never moves and it gets locked out."""
+    monkeypatch.setenv("PAYSTACK_MODE", "test")
+    monkeypatch.setenv("PAYSTACK_SECRET_KEY_TEST", "sk_test_x")
+    mock_client, subs = _supa_with_customer_row({"store_id": "store_1", "paystack_subscription_code": "SUB_x"})
+    mock_supa.return_value = mock_client
+    mock_fetch.return_value = {"next_payment_date": "2027-01-01T00:00:00.000Z"}
+
+    payload = {
+        "event": "charge.success",
+        "data": {"id": 777, "customer": {"customer_code": "CUS_x"}, "amount": 15000},
+    }
+    raw = json.dumps(payload).encode("utf-8")
+    resp = client.post("/paystack/webhook", content=raw, headers={"x-paystack-signature": _sign("sk_test_x", raw)})
+    assert resp.status_code == 200, resp.text
+
+    upserted = subs.upsert.call_args[0][0]
+    assert upserted["store_id"] == "store_1"
+    assert upserted["status"] == "active"
+    assert upserted["paystack_subscription_code"] == "SUB_x"
+    assert upserted["current_period_end"] == "2027-01-01T00:00:00.000Z"
+    mock_fetch.assert_called_once_with("SUB_x")
+
+
+@patch("app.db.supabase.get_supabase_client")
+def test_webhook_without_metadata_and_unknown_customer_is_ignored(mock_supa, client, monkeypatch):
+    monkeypatch.setenv("PAYSTACK_MODE", "test")
+    monkeypatch.setenv("PAYSTACK_SECRET_KEY_TEST", "sk_test_x")
+    mock_client, subs = _supa_with_customer_row(None)
+    mock_supa.return_value = mock_client
+
+    payload = {
+        "event": "subscription.create",
+        "data": {"id": 999, "customer": {"customer_code": "CUS_stranger"}, "subscription_code": "SUB_z"},
+    }
+    raw = json.dumps(payload).encode("utf-8")
+    resp = client.post("/paystack/webhook", content=raw, headers={"x-paystack-signature": _sign("sk_test_x", raw)})
+    assert resp.status_code == 200, resp.text
+    subs.upsert.assert_not_called()
 
 
 @patch("app.clients.paystack.fetch_subscription_by_code")

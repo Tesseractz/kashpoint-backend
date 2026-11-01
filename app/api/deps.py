@@ -4,6 +4,7 @@ from fastapi import Header, HTTPException, status
 
 from app.core.auth import verify_supabase_jwt
 from app.db.supabase import get_supabase_client
+from app.services.subscriptions import new_store_subscription
 
 
 class RequestContext:
@@ -47,7 +48,7 @@ def _create_store_and_profile(supa, user_id: str, user_metadata: dict) -> dict:
     # subscriptions is keyed by store_id (no id column in the production schema)
     existing_sub = supa.table("subscriptions").select("store_id").eq("store_id", store_id).limit(1).execute()
     if not existing_sub.data:
-        supa.table("subscriptions").insert({"store_id": store_id, "plan": "free", "status": "active"}).execute()
+        supa.table("subscriptions").insert(new_store_subscription(store_id)).execute()
 
     return profile_result.data[0]
 

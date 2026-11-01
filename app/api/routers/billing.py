@@ -70,14 +70,14 @@ def _safe_subscription_upsert(supa, payload: dict) -> None:
     supa.table("subscriptions").upsert(current).execute()
 
 
-def _webhook_next_payment_iso(data: dict) -> Optional[str]:
+def _webhook_next_payment_iso(data: dict, subscription_code: Optional[str] = None) -> Optional[str]:
     """Paystack next charge date for subscription webhooks / charge.success payloads."""
     sub = data.get("subscription")
     if isinstance(sub, dict) and sub.get("next_payment_date"):
         return sub.get("next_payment_date")
     if data.get("next_payment_date"):
         return data.get("next_payment_date")
-    sc = data.get("subscription_code")
+    sc = data.get("subscription_code") or subscription_code
     if isinstance(sub, dict):
         sc = sc or sub.get("subscription_code")
     if sc:
@@ -85,6 +85,28 @@ def _webhook_next_payment_iso(data: dict) -> Optional[str]:
         if details:
             return details.get("next_payment_date")
     return None
+
+
+def _store_for_customer(supa, data: dict) -> Optional[dict]:
+    # Only the first checkout's charge.success carries our metadata. The
+    # subscription.* events and every monthly renewal arrive without it, so the
+    # customer code saved at checkout is the only way back to the store.
+    cust = data.get("customer")
+    code = cust.get("customer_code") if isinstance(cust, dict) else None
+    if not code:
+        return None
+    try:
+        r = (
+            supa.table("subscriptions")
+            .select("store_id, paystack_subscription_code")
+            .eq("paystack_customer_code", code)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(r, "data", None) or []
+        return rows[0] if rows else None
+    except Exception:
+        return None
 
 
 @router.get("/billing")
@@ -111,13 +133,11 @@ def redirect_paystack_return_to_spa(request: Request):
 
 @router.get("/billing/config")
 def get_billing_config():
-    no_trial = (paystack_client.get_paystack_plan_code_no_trial() or "").strip()
     return {
         "provider": "paystack",
         "paystack": {
             "public_key": paystack_client.get_paystack_public_key(),
             "plan_code": paystack_client.get_paystack_plan_code(),
-            "plan_code_no_trial_configured": bool(no_trial),
             "currency": "ZAR",
         },
     }
@@ -137,25 +157,6 @@ def create_checkout_session(
         raise HTTPException(status_code=400, detail="Missing email for Paystack checkout")
 
     supa = supabase_client.get_supabase_client()
-    trial_consumed = False
-    try:
-        sub_row = supa.table("subscriptions").select("trial_consumed_at").eq("store_id", ctx.store_id).single().execute()
-        data = getattr(sub_row, "data", None) or {}
-        if isinstance(data, dict):
-            trial_consumed = bool(data.get("trial_consumed_at"))
-    except Exception:
-        trial_consumed = False
-
-    plan_code: Optional[str] = None
-    if trial_consumed:
-        nt = (paystack_client.get_paystack_plan_code_no_trial() or "").strip()
-        if not nt:
-            raise HTTPException(
-                status_code=400,
-                detail="This store has already used its one-time trial. Add PAYSTACK_PLAN_CODE_NO_TRIAL "
-                "(duplicate of your Pro plan without a trial period) to the server environment.",
-            )
-        plan_code = nt
 
     frontend_url = resolve_frontend_base_url(request)
     callback_url = f"{frontend_url}/billing?success=1"
@@ -173,7 +174,6 @@ def create_checkout_session(
         amount_kobo=amount_kobo,
         callback_url=callback_url,
         metadata={"store_id": str(ctx.store_id), "plan": body.plan},
-        plan_code=plan_code,
     )
     try:
         _safe_subscription_upsert(
@@ -373,6 +373,11 @@ async def paystack_webhook(request: Request):
                 return {"received": True, "duplicate": True}
             raise
 
+    known = None
+    if not store_id:
+        known = _store_for_customer(supa, data)
+        if known:
+            store_id = known.get("store_id")
     if not store_id:
         return {"received": True}
 
@@ -393,12 +398,13 @@ async def paystack_webhook(request: Request):
         if isinstance(sub, dict):
             sub_code = sub_code or sub.get("subscription_code")
             email_tok = email_tok or sub.get("email_token")
+        if not sub_code and known:
+            sub_code = known.get("paystack_subscription_code")
         if sub_code:
             update["paystack_subscription_code"] = sub_code
+            update["current_period_end"] = _webhook_next_payment_iso(data, sub_code)
         if email_tok:
             update["paystack_email_token"] = email_tok
-        if update.get("paystack_subscription_code"):
-            update["current_period_end"] = _webhook_next_payment_iso(data)
         _ensure_trial_consumed_once(supa, store_id, update)
         _safe_subscription_upsert(supa, update)
 

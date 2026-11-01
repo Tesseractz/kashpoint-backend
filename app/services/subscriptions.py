@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import HTTPException
@@ -7,6 +7,17 @@ from fastapi import HTTPException
 from app.db.supabase import get_supabase_client
 
 DEV_PLAN_OVERRIDE = os.getenv("DEV_PLAN_OVERRIDE", "").lower()
+
+TRIAL_DAYS = 30
+
+
+def new_store_subscription(store_id: str) -> dict:
+    return {
+        "store_id": store_id,
+        "plan": "pro",
+        "status": "trialing",
+        "trial_end": (datetime.now(timezone.utc) + timedelta(days=TRIAL_DAYS)).isoformat(),
+    }
 
 
 def _parse_iso(value: Optional[str]) -> Optional[datetime]:
@@ -144,16 +155,10 @@ def get_store_plan(store_id: str) -> PlanLimits:
             data = res.data or {}
             plan = data.get("plan", "expired")
             status = data.get("status", "expired")
-            trial_end = data.get("trial_end")
-            # One trial per store: if already consumed, do not grant in-app trial perks even if Paystack sends trialing again.
-            if data.get("trial_consumed_at") and status == "trialing":
-                status = "active"
-                trial_end = None
-
             return PlanLimits(
                 plan,
                 status=status,
-                trial_end=trial_end,
+                trial_end=data.get("trial_end"),
                 current_period_end=data.get("current_period_end"),
             )
         except Exception as e:
