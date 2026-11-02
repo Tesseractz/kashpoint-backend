@@ -175,11 +175,14 @@ def create_checkout_session(
         callback_url=callback_url,
         metadata={"store_id": str(ctx.store_id), "plan": body.plan},
     )
+    # Note the provider on the store's existing row. An update, never an
+    # upsert: a store whose signup was cut short has no row yet, and an upsert
+    # here would create one from the column defaults — free and active — in
+    # place of the 30-day trial it was due.
     try:
-        _safe_subscription_upsert(
-            supa,
-            {"store_id": ctx.store_id, "billing_provider": "paystack"},
-        )
+        supa.table("subscriptions").update({"billing_provider": "paystack"}).eq(
+            "store_id", ctx.store_id
+        ).execute()
     except Exception:
         pass
     # Returning the reference lets the mobile client verify the transaction

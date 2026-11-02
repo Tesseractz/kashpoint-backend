@@ -3,8 +3,9 @@
 The old behaviour returned PlanLimits("expired") from a bare except, so every
 transient Supabase or network error told a paying customer their subscription
 had lapsed — with a clean 200 the client could not distinguish from the real
-thing. These tests pin the new contract: no rows means expired, an error means
-fail open (degraded), and a readable row is reported as-is.
+thing. These tests pin the new contract: no row means a signup that was cut
+short, so the store gets its trial (or, if even that fails, reads as expired);
+an error means fail open (degraded); a readable row is reported as-is.
 """
 from unittest.mock import MagicMock, patch
 
@@ -34,10 +35,28 @@ def test_active_pro_row_is_reported_as_active():
     assert limits.degraded is False
 
 
-def test_missing_subscription_row_really_is_expired():
+def test_missing_subscription_row_gets_its_trial():
+    # The app never deletes subscription rows, so "no row" is a signup whose
+    # setup was interrupted before the subscription step — not a store with
+    # no plan. Heal it instead of telling a brand-new shop it has expired.
     err = Exception("JSON object requested, multiple (or no) rows returned")
     err.code = "PGRST116"
-    with patch.object(subscriptions, "get_supabase_client", return_value=_client_raising(err)):
+    healed = {"plan": "pro", "status": "trialing", "trial_end": "2099-01-01T00:00:00+00:00",
+              "current_period_end": None}
+    with patch.object(subscriptions, "get_supabase_client", return_value=_client_raising(err)), \
+            patch.object(subscriptions, "ensure_store_subscription", return_value=healed) as heal:
+        limits = subscriptions.get_store_plan("store-1")
+    heal.assert_called_once()
+    assert heal.call_args.args[1] == "store-1"
+    assert limits.is_on_trial is True
+    assert limits.degraded is False
+
+
+def test_missing_row_that_cannot_be_healed_reads_as_expired():
+    err = Exception("JSON object requested, multiple (or no) rows returned")
+    err.code = "PGRST116"
+    with patch.object(subscriptions, "get_supabase_client", return_value=_client_raising(err)), \
+            patch.object(subscriptions, "ensure_store_subscription", side_effect=RuntimeError("down")):
         limits = subscriptions.get_store_plan("store-1")
     assert limits.plan == "expired"
     assert limits.is_active is False

@@ -1,10 +1,11 @@
+import time
 from typing import Optional
 
 from fastapi import Header, HTTPException, status
 
 from app.core.auth import verify_supabase_jwt
 from app.db.supabase import get_supabase_client
-from app.services.subscriptions import new_store_subscription
+from app.services.subscriptions import ensure_store_subscription
 
 
 class RequestContext:
@@ -14,43 +15,121 @@ class RequestContext:
         self.role = role
 
 
+# A fresh account's first page load fires several requests at once, and the
+# shared Supabase client answers some of them with transient transport errors
+# ("[Errno 11] Resource temporarily unavailable", timeouts, dropped
+# connections). Those deserve a short retry; anything else is a real error.
+_TRANSIENT_MARKERS = (
+    "errno 11",
+    "resource temporarily unavailable",
+    "timed out",
+    "timeout",
+    "connection reset",
+    "connection aborted",
+    "server disconnected",
+    "remote protocol error",
+    "readerror",
+    "writeerror",
+    "connecterror",
+)
+RETRY_ATTEMPTS = 4
+RETRY_BASE_DELAY = 0.2
+
+
+def _is_transient(err: Exception) -> bool:
+    text = f"{type(err).__name__} {err}".lower()
+    return any(marker in text for marker in _TRANSIENT_MARKERS)
+
+
+def _retry(op):
+    """Run op(), retrying transient transport errors with a short backoff."""
+    for attempt in range(RETRY_ATTEMPTS):
+        try:
+            return op()
+        except Exception as e:
+            if not _is_transient(e) or attempt == RETRY_ATTEMPTS - 1:
+                raise
+            time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+
+
 def _create_store_and_profile(supa, user_id: str, user_metadata: dict) -> dict:
-    """Create store, profile, and subscription for a new user."""
+    """Create — or finish creating — the store, profile and trial subscription
+    of a new account.
+
+    Every request of a fresh account's first page load lands here at the same
+    time, so each step is idempotent and resumable: a request cut short
+    half-way is completed by the next one, and all of them converge on one
+    store, one profile and one subscription row. Before this, a signup
+    interrupted after the profile step left a store with no subscription row
+    at all, which read as "expired" and later let checkout plant a free row
+    in place of the 30-day trial.
+    """
     store_name = user_metadata.get("store_name", "My Store")
 
-    existing_store = supa.table("stores").select("id").eq("owner_id", user_id).limit(1).execute()
-    if existing_store.data:
-        store_id = existing_store.data[0]["id"]
-    else:
-        store_result = supa.table("stores").insert({"name": store_name, "owner_id": user_id}).execute()
-
-        if not store_result.data:
-            raise HTTPException(status_code=500, detail="Failed to create store")
-
-        store_id = store_result.data[0]["id"]
-
-    profile_result = (
-        supa.table("profiles")
-        .insert(
-            {
-                "id": user_id,
-                "name": user_metadata.get("email", "User"),
-                "role": "admin",
-                "store_id": store_id,
-            }
+    def find_store() -> Optional[str]:
+        res = (
+            supa.table("stores")
+            .select("id")
+            .eq("owner_id", user_id)
+            .order("created_at")
+            .limit(1)
+            .execute()
         )
-        .execute()
-    )
+        rows = getattr(res, "data", None) or []
+        return rows[0]["id"] if rows else None
 
-    if not profile_result.data:
+    store_id = _retry(find_store)
+    if not store_id:
+        try:
+            res = _retry(
+                lambda: supa.table("stores").insert({"name": store_name, "owner_id": user_id}).execute()
+            )
+            rows = getattr(res, "data", None) or []
+            store_id = rows[0]["id"] if rows else None
+        except Exception:
+            # Another request of the same burst may have created it meanwhile.
+            store_id = _retry(find_store)
+            if not store_id:
+                raise
+    if not store_id:
+        raise HTTPException(status_code=500, detail="Failed to create store")
+
+    profile = {
+        "id": user_id,
+        "name": user_metadata.get("email", "User"),
+        "role": "admin",
+        "store_id": store_id,
+    }
+
+    def write_profile() -> Optional[dict]:
+        res = supa.table("profiles").upsert(profile, on_conflict="id", ignore_duplicates=True).execute()
+        rows = getattr(res, "data", None) or []
+        return rows[0] if rows else None
+
+    def read_profile() -> Optional[dict]:
+        res = supa.table("profiles").select("*").eq("id", user_id).limit(1).execute()
+        rows = getattr(res, "data", None) or []
+        return rows[0] if rows else None
+
+    try:
+        row = _retry(write_profile)
+    except Exception:
+        row = None
+    if row is None:
+        # ignore-duplicates returns nothing when the profile already existed.
+        row = _retry(read_profile)
+    if not row:
         raise HTTPException(status_code=500, detail="Failed to create profile")
 
-    # subscriptions is keyed by store_id (no id column in the production schema)
-    existing_sub = supa.table("subscriptions").select("store_id").eq("store_id", store_id).limit(1).execute()
-    if not existing_sub.data:
-        supa.table("subscriptions").insert(new_store_subscription(store_id)).execute()
+    # The subscription is the step most often cut short, and it must not fail
+    # the request: the profile exists now, and get_store_plan creates the
+    # trial on the next read if this attempt does not get there either.
+    try:
+        _retry(lambda: ensure_store_subscription(supa, store_id))
+    except Exception as e:
+        print(f"[signup] store {store_id}: trial subscription not created yet: {e!r}")
 
-    return profile_result.data[0]
+    return row
 
 
 def get_current_context(authorization: Optional[str] = Header(None)) -> RequestContext:

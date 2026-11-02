@@ -20,6 +20,28 @@ def new_store_subscription(store_id: str) -> dict:
     }
 
 
+def ensure_store_subscription(supa, store_id: str) -> dict:
+    """Give a store its trial subscription if it has none, and return the row.
+
+    Never touches an existing row: an interrupted signup being finished, or two
+    first requests racing each other, must not reset a store that is already
+    on a plan. ignore-duplicates makes Postgres skip the insert on conflict and
+    return nothing, so the existing row is read back in that case.
+    """
+    payload = new_store_subscription(store_id)
+    res = (
+        supa.table("subscriptions")
+        .upsert(payload, on_conflict="store_id", ignore_duplicates=True)
+        .execute()
+    )
+    rows = getattr(res, "data", None) or []
+    if rows:
+        return rows[0]
+    res = supa.table("subscriptions").select("*").eq("store_id", store_id).limit(1).execute()
+    rows = getattr(res, "data", None) or []
+    return rows[0] if rows else payload
+
+
 def _parse_iso(value: Optional[str]) -> Optional[datetime]:
     """Parse a stored ISO timestamp, tolerating 'Z' and naive values."""
     if not value:
@@ -142,6 +164,23 @@ class PlanLimits:
         return self.is_active and self.plan in ("pro", "business")
 
 
+def _limits_from_row(data: dict) -> PlanLimits:
+    return PlanLimits(
+        data.get("plan", "expired"),
+        status=data.get("status", "expired"),
+        trial_end=data.get("trial_end"),
+        current_period_end=data.get("current_period_end"),
+    )
+
+
+def _heal_missing_subscription(supa, store_id: str) -> dict:
+    try:
+        return ensure_store_subscription(supa, store_id)
+    except Exception as e:
+        print(f"[plan] store {store_id} has no subscription row and creating one failed: {e!r}")
+        return {"plan": "expired", "status": "expired"}
+
+
 def get_store_plan(store_id: str) -> PlanLimits:
     if DEV_PLAN_OVERRIDE in ("pro", "business"):
         normalized = "pro" if DEV_PLAN_OVERRIDE == "business" else DEV_PLAN_OVERRIDE
@@ -152,20 +191,15 @@ def get_store_plan(store_id: str) -> PlanLimits:
     for _attempt in range(2):
         try:
             res = supa.table("subscriptions").select("*").eq("store_id", store_id).single().execute()
-            data = res.data or {}
-            plan = data.get("plan", "expired")
-            status = data.get("status", "expired")
-            return PlanLimits(
-                plan,
-                status=status,
-                trial_end=data.get("trial_end"),
-                current_period_end=data.get("current_period_end"),
-            )
+            return _limits_from_row(res.data or {})
         except Exception as e:
-            # PGRST116 is PostgREST's "single() matched no rows": the store
-            # genuinely has no subscription, which really is no plan.
+            # PGRST116 is PostgREST's "single() matched no rows". No row at
+            # all is not a store with no plan — the app never deletes these
+            # rows — it is a signup whose setup was cut short before the
+            # subscription step (a fresh account's first page load fires
+            # several requests at once). Give it the trial it was due.
             if getattr(e, "code", None) == "PGRST116":
-                return PlanLimits("expired", status="expired")
+                return _limits_from_row(_heal_missing_subscription(supa, store_id))
             last_error = e
 
     # The lookup itself failed — a transient Supabase or network error, not a
