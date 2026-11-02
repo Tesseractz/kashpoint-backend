@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 _ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 load_dotenv(dotenv_path=_ENV_PATH, override=False)
 
-from app.api.routers import billing, customers, expenses, legal_health, notifications, privacy, products, profile_plan, reports, users
+from app.api.routers import billing, customers, expenses, legal_health, notifications, privacy, products, profile_plan, reports, store, users
 from app.core.http_config import allowed_origins
 from app.core.password_crypto import _decrypt_password, _encrypt_password
 from app.services.rate_limit import get_rate_limiter
@@ -60,6 +60,7 @@ async def rate_limit_middleware(request: Request, call_next):
 app.include_router(products.router)
 app.include_router(billing.router)
 app.include_router(profile_plan.router)
+app.include_router(store.router)
 app.include_router(users.router)
 app.include_router(reports.router)
 app.include_router(customers.router)

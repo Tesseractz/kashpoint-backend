@@ -544,91 +544,9 @@ class TestDailySummaryNotificationAPI:
         assert "not configured" in data["message"].lower()
 
 
-class TestReceiptAPI:
-    """Tests for receipt sending endpoint."""
-    
-    @patch('app.db.supabase.get_supabase_client')
-    def test_send_receipt_sale_not_found(self, mock_supabase, admin_client):
-        """Test error when sale is not found."""
-        mock_query = MagicMock()
-        mock_query.execute.return_value.data = None
-        mock_query.select.return_value = mock_query
-        mock_query.eq.return_value = mock_query
-        mock_query.single.return_value = mock_query
-        mock_supabase.return_value.table.return_value = mock_query
-        
-        response = admin_client.post(
-            "/receipts/send",
-            json={"sale_id": 999}
-        )
-        
-        assert response.status_code == 404
-    
-    @patch('app.services.notifications.generate_receipt_html')
-    @patch('app.services.notifications.send_email')
-    @patch('app.db.supabase.get_supabase_client')
-    def test_send_receipt_email_success(self, mock_supabase, mock_send_email, mock_gen_html, admin_client):
-        """Test sending receipt email successfully."""
-        from app.services.notifications import NotificationResult
-        
-        mock_supabase_instance = MagicMock()
-        
-        now = datetime.now(timezone.utc).isoformat()
-        
-        # Sale query
-        sale_query = MagicMock()
-        sale_query.execute.return_value.data = {
-            "id": 1,
-            "product_id": 1,
-            "quantity_sold": 2,
-            "total_price": 200.0,
-            "timestamp": now,
-            "store_id": "test-store-id"
-        }
-        sale_query.select.return_value = sale_query
-        sale_query.eq.return_value = sale_query
-        sale_query.single.return_value = sale_query
-        
-        # Product query
-        product_query = MagicMock()
-        product_query.execute.return_value.data = {
-            "id": 1,
-            "name": "Test Product",
-            "price": 100.0
-        }
-        product_query.select.return_value = product_query
-        product_query.eq.return_value = product_query
-        product_query.single.return_value = product_query
-        
-        def table_router(table_name):
-            if table_name == "sales":
-                return sale_query
-            elif table_name == "products":
-                return product_query
-            return MagicMock()
-        
-        mock_supabase_instance.table = table_router
-        mock_supabase.return_value = mock_supabase_instance
-        
-        mock_gen_html.return_value = "<html>Receipt</html>"
-        mock_send_email.return_value = NotificationResult(
-            success=True,
-            message="Sent",
-            recipient="customer@example.com"
-        )
-        
-        response = admin_client.post(
-            "/receipts/send",
-            json={
-                "sale_id": 1,
-                "customer_email": "customer@example.com",
-                "send_email": True
-            }
-        )
-        
-        assert response.status_code == 200
-        data = response.json()
-        assert data["success"] is True
+# The receipt endpoint (/receipts/send) is covered in tests/test_receipts.py
+# against an in-memory database: every line of a multi-item sale, the shop's
+# own details, 404 for another shop's sale, and a failed send being reported.
 
 
 class TestBillingCheckoutAPI:

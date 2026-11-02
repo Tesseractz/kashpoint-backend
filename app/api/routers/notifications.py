@@ -6,6 +6,7 @@ from pydantic import BaseModel
 import app.services.fcm as fcm_mod
 import app.services.notifications as notifications_mod
 import app.services.push as push_mod
+import app.services.receipts as receipts_mod
 import app.services.subscriptions as subscriptions
 import app.db.supabase as supabase_client
 from app.api.deps import RequestContext, get_current_context
@@ -19,11 +20,16 @@ router = APIRouter()
 
 class NotificationStatus(BaseModel):
     email_configured: bool
+    # 'smtp' (the business's own mailbox), 'brevo', or None
+    email_transport: Optional[str] = None
 
 
 @router.get("/notifications/status", response_model=NotificationStatus)
 def get_notification_status(ctx: RequestContext = Depends(get_current_context)):
-    return NotificationStatus(email_configured=notifications_mod.is_email_configured())
+    return NotificationStatus(
+        email_configured=notifications_mod.is_email_configured(),
+        email_transport=notifications_mod.email_transport(),
+    )
 
 
 @router.get("/push/vapid-public-key")
@@ -330,64 +336,47 @@ def send_daily_summary_notification(request: DailySummaryRequest, ctx: RequestCo
 
 @router.post("/receipts/send", response_model=NotificationResponse)
 def send_receipt(request: notifications_mod.ReceiptRequest, ctx: RequestContext = Depends(get_current_context)):
+    """Email the customer a receipt for a sale: every product line of it,
+    under the shop's own name and details."""
+    sale_ids = request.all_sale_ids()
+    if not sale_ids:
+        raise HTTPException(status_code=400, detail="No sale to send a receipt for")
+    if request.send_email and not (request.customer_email or "").strip():
+        raise HTTPException(status_code=400, detail="Enter the customer's email address")
+
     supabase = supabase_client.get_supabase_client()
     try:
-        sale_res = (
-            supabase.table("sales")
-            .select("*")
-            .eq("id", request.sale_id)
-            .eq("store_id", ctx.store_id)
-            .single()
-            .execute()
+        receipt = receipts_mod.build_receipt(
+            supabase,
+            ctx.store_id,
+            sale_ids,
+            payment_method=request.payment_method,
+            payment_amount=request.payment_amount,
+            change=request.change_amount,
+            customer_id=request.customer_id,
         )
-        sale = sale_res.data
-        if not sale:
-            raise HTTPException(status_code=404, detail="Sale not found")
-    except HTTPException:
-        raise
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Sale not found")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    try:
-        product_res = supabase.table("products").select("id,name,price").eq("id", sale["product_id"]).single().execute()
-        product = product_res.data or {}
-    except Exception:
-        product = {"name": f"Product #{sale['product_id']}", "price": 0}
-
-    total_price = float(sale.get("total_price", 0))
-    sale_data = {
-        "id": sale["id"],
-        "timestamp": sale.get("timestamp", ""),
-        "total": total_price,
-        "item_count": sale.get("quantity_sold", 0),
-        "items": [
-            {
-                "name": product.get("name", "Product"),
-                "quantity": sale.get("quantity_sold", 1),
-                "price": float(product.get("price", 0)),
-                "total": total_price,
-            }
-        ],
-        "payment_method": request.payment_method or "cash",
-        "payment_amount": request.payment_amount or total_price,
-        "change": request.change_amount or 0,
-    }
+        raise HTTPException(status_code=500, detail=f"Could not build the receipt: {e}")
 
     results = []
-
     if request.send_email and request.customer_email:
-        html_body = notifications_mod.generate_receipt_html(sale_data)
+        store = receipt["store"]
         result = notifications_mod.send_email(
-            request.customer_email,
-            f"Receipt #{sale['id']} - KashPoint",
-            html_body,
+            request.customer_email.strip(),
+            receipts_mod.receipt_subject(receipt),
+            receipts_mod.receipt_html(receipt),
+            text_body=receipts_mod.receipt_text(receipt),
+            from_name=f"{store['name']} via KashPoint",
+            reply_to=store.get("email") or None,
         )
         results.append(result.model_dump())
 
     all_success = all(r.get("success", False) for r in results) if results else True
-
     return NotificationResponse(
         success=all_success,
         results=results,
-        message="Receipt sent" if all_success else "Failed to send receipt",
+        payload={"receipt": receipt},
+        message="Receipt sent" if all_success else (results[0].get("message") if results else "Receipt ready"),
     )

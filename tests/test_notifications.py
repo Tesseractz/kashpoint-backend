@@ -11,6 +11,14 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+@pytest.fixture(autouse=True)
+def _no_smtp(monkeypatch):
+    """These tests exercise the Brevo route; a developer's .env may configure
+    SMTP, which would take precedence (and try to connect)."""
+    for key in ("SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD", "SMTP_PORT", "SMTP_FROM", "SMTP_FROM_NAME"):
+        monkeypatch.delenv(key, raising=False)
+
+
 class TestIsEmailConfigured:
     """Tests for is_email_configured function."""
     

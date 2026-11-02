@@ -8,6 +8,7 @@ import app.services.analytics as analytics_mod
 import app.services.subscriptions as subscriptions
 import app.db.supabase as supabase_client
 from app.services.analytics import AnalyticsSummary
+from app.services.store_profile import empty_profile, read_store
 from app.api.deps import RequestContext, get_current_context
 
 router = APIRouter()
@@ -22,18 +23,18 @@ def get_profile(ctx: RequestContext = Depends(get_current_context)):
         if prof_result.data and len(prof_result.data) > 0:
             profile_data = prof_result.data[0]
             store_id = profile_data.get("store_id", ctx.store_id)
-            store_name = None
             try:
-                store_res = supabase.table("stores").select("name").eq("id", store_id).single().execute()
-                store_name = (store_res.data or {}).get("name")
+                store = read_store(supabase, store_id)
             except Exception:
-                store_name = None
+                store = empty_profile(store_id)
             return {
                 "id": profile_data["id"],
                 "name": profile_data.get("name"),
                 "role": profile_data.get("role", ctx.role),
                 "store_id": store_id,
-                "store_name": store_name,
+                "store_name": store.get("name"),
+                # The receipt profile: logo, address, VAT number, footer...
+                "store": store,
             }
         else:
             return {
@@ -42,6 +43,7 @@ def get_profile(ctx: RequestContext = Depends(get_current_context)):
                 "role": ctx.role,
                 "store_id": ctx.store_id,
                 "store_name": None,
+                "store": empty_profile(ctx.store_id),
             }
     except Exception as e:
         print(f"[Profile API] Error fetching profile: {e}")
@@ -51,6 +53,7 @@ def get_profile(ctx: RequestContext = Depends(get_current_context)):
             "role": ctx.role,
             "store_id": ctx.store_id,
             "store_name": None,
+            "store": empty_profile(ctx.store_id),
         }
 
 
