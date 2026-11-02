@@ -122,6 +122,100 @@ def initialize_transaction(
     return {"url": url, "reference": reference}
 
 
+def initialize_card_check(
+    *,
+    email: str,
+    amount_cents: int,
+    callback_url: str,
+    metadata: dict,
+) -> Dict[str, str]:
+    """Hosted payment page for the small card check that saves a card.
+
+    No plan here: a plan would charge the full monthly amount now. The check
+    only obtains a reusable card authorization; it is refunded straight after
+    and the subscription is created separately with a future first debit.
+    Card only, because only cards can be billed again each month.
+    """
+    secret = get_paystack_secret_key()
+    if not secret:
+        raise Exception("Missing PAYSTACK_SECRET_KEY")
+    resp = httpx.post(
+        "https://api.paystack.co/transaction/initialize",
+        headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"},
+        json={
+            "email": email,
+            "amount": int(amount_cents),
+            "currency": "ZAR",
+            "channels": ["card"],
+            "callback_url": callback_url,
+            "metadata": metadata,
+        },
+        timeout=15.0,
+    )
+    data = resp.json() if resp.content else {}
+    if resp.status_code >= 400 or not data.get("status"):
+        raise Exception(data.get("message") or f"Paystack init failed: HTTP {resp.status_code}")
+    body = data.get("data") or {}
+    url, reference = body.get("authorization_url"), body.get("reference")
+    if not url or not reference:
+        raise Exception("Paystack response missing authorization_url or reference")
+    return {"url": url, "reference": reference}
+
+
+def create_subscription(*, customer: str, authorization: str, start_date: str) -> Dict[str, Any]:
+    """Subscribe a saved card to the Pro plan, first debit on `start_date`.
+
+    Verified in Paystack test mode: the response's next_payment_date equals
+    start_date, and nothing is charged before it.
+    """
+    secret = get_paystack_secret_key()
+    if not secret:
+        raise Exception("Missing PAYSTACK_SECRET_KEY")
+    plan = get_paystack_plan_code()
+    if not plan:
+        raise Exception("Missing PAYSTACK_PLAN_CODE")
+    resp = httpx.post(
+        "https://api.paystack.co/subscription",
+        headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"},
+        json={"customer": customer, "plan": plan, "authorization": authorization, "start_date": start_date},
+        timeout=20.0,
+    )
+    data = resp.json() if resp.content else {}
+    if resp.status_code >= 400 or not data.get("status"):
+        raise Exception(data.get("message") or f"Paystack subscription failed: HTTP {resp.status_code}")
+    body = data.get("data") or {}
+    if not body.get("subscription_code"):
+        raise Exception("Paystack response missing subscription_code")
+    return body
+
+
+def refund_transaction(*, reference: str) -> bool:
+    """Refund a transaction in full. Returns False instead of raising, so a
+    refund hiccup never undoes a card that was saved correctly."""
+    secret = get_paystack_secret_key()
+    if not secret or not reference:
+        return False
+    try:
+        resp = httpx.post(
+            "https://api.paystack.co/refund",
+            headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"},
+            json={"transaction": reference},
+            timeout=15.0,
+        )
+        data = resp.json() if resp.content else {}
+    except Exception as e:
+        print(f"[Paystack] refund of {reference} failed: {e!r}")
+        return False
+    if resp.status_code >= 400 or not data.get("status"):
+        # Already refunded is a success for our purposes.
+        msg = str(data.get("message") or "")
+        if "reversed" in msg.lower() or "refunded" in msg.lower():
+            return True
+        print(f"[Paystack] refund of {reference} refused: {msg or resp.status_code}")
+        return False
+    return True
+
+
 def verify_transaction(*, reference: str) -> dict:
     """
     Verify a Paystack transaction by reference (from checkout redirect).

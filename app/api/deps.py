@@ -3,6 +3,7 @@ from typing import Optional
 from fastapi import Header, HTTPException, status
 
 from app.core.auth import verify_supabase_jwt
+from app.core.phone import normalize_phone
 from app.db.supabase import get_supabase_client, retry_transient
 from app.services.subscriptions import ensure_store_subscription
 
@@ -12,6 +13,29 @@ class RequestContext:
         self.user_id = user_id
         self.store_id = store_id
         self.role = role
+
+
+def _missing_column(err: Exception, column: str) -> bool:
+    """PostgREST's answer when a write names a column the table doesn't have."""
+    text = str(err)
+    return f"'{column}'" in text and ("PGRST204" in text or "column" in text.lower())
+
+
+def _insert_store(supa, payload: dict):
+    """Insert the store, dropping `phone` if the column hasn't been added yet.
+
+    The phone number is also kept in the user's auth metadata, so nothing is
+    lost while the stores.phone migration is pending; signups must never fail
+    over it.
+    """
+    try:
+        return supa.table("stores").insert(payload).execute()
+    except Exception as e:
+        if "phone" in payload and _missing_column(e, "phone"):
+            print("[signup] stores.phone column missing; saving the store without it")
+            rest = {k: v for k, v in payload.items() if k != "phone"}
+            return supa.table("stores").insert(rest).execute()
+        raise
 
 
 def _create_store_and_profile(supa, user_id: str, user_metadata: dict) -> dict:
@@ -27,6 +51,10 @@ def _create_store_and_profile(supa, user_id: str, user_metadata: dict) -> dict:
     in place of the 30-day trial.
     """
     store_name = user_metadata.get("store_name", "My Store")
+    store_payload = {"name": store_name, "owner_id": user_id}
+    phone = normalize_phone(user_metadata.get("phone"))
+    if phone:
+        store_payload["phone"] = phone
 
     def find_store() -> Optional[str]:
         res = (
@@ -43,9 +71,7 @@ def _create_store_and_profile(supa, user_id: str, user_metadata: dict) -> dict:
     store_id = retry_transient(find_store)
     if not store_id:
         try:
-            res = retry_transient(
-                lambda: supa.table("stores").insert({"name": store_name, "owner_id": user_id}).execute()
-            )
+            res = retry_transient(lambda: _insert_store(supa, store_payload))
             rows = getattr(res, "data", None) or []
             store_id = rows[0]["id"] if rows else None
         except Exception:
@@ -62,6 +88,10 @@ def _create_store_and_profile(supa, user_id: str, user_metadata: dict) -> dict:
         "role": "admin",
         "store_id": store_id,
     }
+    # The signup form's optional "product updates and tips" box. It was shown
+    # but never stored before.
+    if "marketing_opt_in" in user_metadata:
+        profile["marketing_emails_enabled"] = bool(user_metadata.get("marketing_opt_in"))
 
     def write_profile() -> Optional[dict]:
         res = supa.table("profiles").upsert(profile, on_conflict="id", ignore_duplicates=True).execute()

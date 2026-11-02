@@ -10,6 +10,13 @@ DEV_PLAN_OVERRIDE = os.getenv("DEV_PLAN_OVERRIDE", "").lower()
 
 TRIAL_DAYS = 30
 
+# A store with a card on file is charged by Paystack on its billing date, but
+# the charge and its webhook can land hours after the exact timestamp we hold.
+# For that window the store keeps Pro instead of locking a paying customer out
+# of their till. A failed charge (invoice.payment_failed -> past_due) or a
+# cancellation ends it at once; this only covers "nothing has arrived yet".
+PAYMENT_GRACE = timedelta(days=3)
+
 
 def new_store_subscription(store_id: str) -> dict:
     return {
@@ -62,6 +69,7 @@ class PlanLimits:
         status: str = "active",
         trial_end: Optional[str] = None,
         current_period_end: Optional[str] = None,
+        has_card: bool = False,
     ):
         normalized_plan = "pro" if plan == "business" else plan
         self.plan = normalized_plan
@@ -71,6 +79,8 @@ class PlanLimits:
         self.status = st
         self.trial_end = trial_end
         self.current_period_end = current_period_end
+        # A Paystack subscription exists: Paystack will charge on its own.
+        self.has_card = bool(has_card)
         # True when this object is a fail-open stand-in because the subscription
         # could not be read at all — not a statement about the store's plan.
         self.degraded = False
@@ -96,6 +106,20 @@ class PlanLimits:
             return False
         return datetime.now(timezone.utc) >= period_dt
 
+    def _charge_pending(self, due: Optional[str]) -> bool:
+        """True while a store with a card on file waits for Paystack's charge.
+
+        Only for stores Paystack will bill by itself, and only for a few days
+        after the date the charge was due.
+        """
+        if not self.has_card:
+            return False
+        due_dt = _parse_iso(due)
+        if not due_dt:
+            return False
+        now = datetime.now(timezone.utc)
+        return due_dt <= now < due_dt + PAYMENT_GRACE
+
     @property
     def is_active(self) -> bool:
         paid_plan = self.plan in ("pro", "business")
@@ -103,14 +127,18 @@ class PlanLimits:
             # Nothing ever expires a subscription on a timer, so a lapsed
             # paid-through date must revoke access here — otherwise a store
             # whose cancellation or renewal failure never reached us keeps
-            # full access forever.
-            return not self._period_expired
+            # full access forever. A renewal Paystack is about to charge gets
+            # a short grace instead of a lockout on the morning it is due.
+            return not self._period_expired or self._charge_pending(self.current_period_end)
         if self.status == "past_due" and paid_plan:
             # Paystack retries a failed charge for a while. Keep access until
             # the period they already paid for runs out, then stop.
             return bool(self.current_period_end) and not self._period_expired
         if self.status == "trialing" and self._is_trial_active:
             return True
+        if self.status == "trialing" and paid_plan:
+            # Trial over, card on file: the first R150 is being charged.
+            return self._charge_pending(self.trial_end)
         return False
 
     @property
@@ -170,7 +198,16 @@ def _limits_from_row(data: dict) -> PlanLimits:
         status=data.get("status", "expired"),
         trial_end=data.get("trial_end"),
         current_period_end=data.get("current_period_end"),
+        has_card=bool(data.get("paystack_subscription_code")),
     )
+
+
+def trial_running(row: Optional[dict]) -> bool:
+    """The store is inside its 30-day trial right now."""
+    if not row or row.get("status") != "trialing":
+        return False
+    end = _parse_iso(row.get("trial_end"))
+    return bool(end) and datetime.now(timezone.utc) < end
 
 
 def _heal_missing_subscription(supa, store_id: str) -> dict:
@@ -257,6 +294,10 @@ def get_plan_info(store_id: str) -> dict:
         "current_period_end": sub_data.get("current_period_end") or limits.current_period_end,
         "trial_consumed": bool(sub_data.get("trial_consumed_at")),
         "has_paystack_subscription": bool(sub_data.get("paystack_subscription_code")),
+        # A card is saved and Paystack will bill it: during the trial that
+        # means "first R150 on trial_end", afterwards it is the renewal card.
+        "card_on_file": bool(sub_data.get("paystack_subscription_code"))
+        and (sub_data.get("status") in ("trialing", "active", "past_due")),
         "billing_provider": sub_data.get("billing_provider"),
         "limits": {
             "max_products": limits.max_products,

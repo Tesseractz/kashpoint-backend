@@ -97,7 +97,7 @@ class TestWebhookReplayKey:
     """The cancellation of a subscription must not be mistaken for a replay
     of that same subscription's creation."""
 
-    @patch.dict("os.environ", {"PAYSTACK_SECRET_KEY": SECRET, "PAYSTACK_MODE": ""})
+    @patch.dict("os.environ", {"PAYSTACK_SECRET_KEY": SECRET, "PAYSTACK_SECRET_KEY_LIVE": SECRET, "PAYSTACK_MODE": ""})
     @patch("app.db.supabase.get_supabase_client")
     def test_disable_after_create_is_processed_not_deduped(self, mock_client):
         supa = MagicMock()
@@ -132,7 +132,7 @@ class TestWebhookReplayKey:
         # Two distinct keys recorded, both namespaced by event type.
         assert seen_ids == {"paystack:subscription.create:555", "paystack:subscription.disable:555"}
 
-    @patch.dict("os.environ", {"PAYSTACK_SECRET_KEY": SECRET, "PAYSTACK_MODE": ""})
+    @patch.dict("os.environ", {"PAYSTACK_SECRET_KEY": SECRET, "PAYSTACK_SECRET_KEY_LIVE": SECRET, "PAYSTACK_MODE": ""})
     @patch("app.db.supabase.get_supabase_client")
     def test_a_genuine_retry_of_the_same_event_is_still_deduped(self, mock_client):
         supa = MagicMock()
