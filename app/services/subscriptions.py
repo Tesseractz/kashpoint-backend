@@ -4,7 +4,7 @@ from typing import Optional
 
 from fastapi import HTTPException
 
-from app.db.supabase import get_supabase_client
+from app.db.supabase import get_supabase_client, retry_transient
 
 DEV_PLAN_OVERRIDE = os.getenv("DEV_PLAN_OVERRIDE", "").lower()
 
@@ -230,10 +230,17 @@ def get_plan_info(store_id: str) -> dict:
     limits = get_store_plan(store_id)
     supa = get_supabase_client()
 
-    product_count = len((supa.table("products").select("id").eq("store_id", store_id).execute()).data or [])
+    # Both reads are part of a fresh account's first page load, which arrives
+    # as a burst; a transient transport error here must not become a 500.
+    products = retry_transient(
+        lambda: supa.table("products").select("id").eq("store_id", store_id).execute()
+    )
+    product_count = len(products.data or [])
 
     try:
-        sub_res = supa.table("subscriptions").select("*").eq("store_id", store_id).single().execute()
+        sub_res = retry_transient(
+            lambda: supa.table("subscriptions").select("*").eq("store_id", store_id).single().execute()
+        )
         sub_data = sub_res.data or {}
     except Exception:
         sub_data = {}
@@ -244,8 +251,10 @@ def get_plan_info(store_id: str) -> dict:
         "degraded": bool(getattr(limits, "degraded", False)),
         "is_active": limits.is_active,
         "is_on_trial": limits.is_on_trial,
-        "trial_end": sub_data.get("trial_end"),
-        "current_period_end": sub_data.get("current_period_end"),
+        # Right after a trial is created, this re-read can lag the plan lookup
+        # by a few milliseconds; fall back to what the lookup itself saw.
+        "trial_end": sub_data.get("trial_end") or limits.trial_end,
+        "current_period_end": sub_data.get("current_period_end") or limits.current_period_end,
         "trial_consumed": bool(sub_data.get("trial_consumed_at")),
         "has_paystack_subscription": bool(sub_data.get("paystack_subscription_code")),
         "billing_provider": sub_data.get("billing_provider"),

@@ -149,7 +149,29 @@ def _is_fresh_trial(sub):
 
 @pytest.fixture(autouse=True)
 def _no_backoff(monkeypatch):
-    monkeypatch.setattr(deps, "RETRY_BASE_DELAY", 0)
+    import app.db.supabase as sb_module
+
+    monkeypatch.setattr(sb_module, "RETRY_BASE_DELAY", 0)
+
+
+class TestRequestContextUnderABurst:
+    @patch("app.api.deps.get_supabase_client")
+    @patch("app.api.deps.verify_supabase_jwt")
+    def test_transient_error_on_the_profile_lookup_is_retried(self, mock_verify, mock_supa):
+        # The very first query of every request. Under a burst it used to
+        # answer 500 "Database error: [Errno 11] ..." with no retry.
+        mock_verify.return_value = {"sub": "u1"}
+        q = MagicMock()
+        q.select.return_value = q
+        q.eq.return_value = q
+        q.execute.side_effect = [
+            OSError(11, "Resource temporarily unavailable"),
+            MagicMock(data=[{"id": "u1", "store_id": "s1", "role": "admin"}]),
+        ]
+        mock_supa.return_value.table.return_value = q
+        ctx = deps.get_current_context("Bearer token")
+        assert ctx.store_id == "s1"
+        assert q.execute.call_count == 2
 
 
 class TestFirstRequestSetup:
@@ -251,6 +273,28 @@ class TestPlanLookupHealsMissingRow:
             info = subscriptions.get_plan_info("s1")
         assert info["is_on_trial"] is True
         assert info["trial_end"] == db.tables["subscriptions"][0]["trial_end"]
+
+    def test_plan_info_falls_back_to_the_lookup_when_the_row_read_lags(self):
+        # Seen live: one burst response carried plan=pro/status=trialing but
+        # trial_end=null, because the re-read raced the row's creation.
+        limits = subscriptions.PlanLimits("pro", status="trialing", trial_end="2099-01-01T00:00:00+00:00")
+        db = FakeSupabase()
+        db.fail("subscriptions", "select", RuntimeError("not visible yet"), times=99)
+        with patch.object(subscriptions, "get_supabase_client", return_value=db), \
+                patch.object(subscriptions, "get_store_plan", return_value=limits):
+            info = subscriptions.get_plan_info("s1")
+        assert info["is_on_trial"] is True
+        assert info["trial_end"] == "2099-01-01T00:00:00+00:00"
+
+    def test_transient_error_on_the_product_count_is_retried(self):
+        # The one unguarded read in /plan — it answered a bare 500 under a burst.
+        db = FakeSupabase()
+        db.tables["subscriptions"].append({"store_id": "s1", "plan": "pro", "status": "active"})
+        db.fail("products", "select", _transient, times=2)
+        with patch.object(subscriptions, "get_supabase_client", return_value=db):
+            info = subscriptions.get_plan_info("s1")
+        assert info["is_active"] is True
+        assert info["usage"]["products"] == 0
 
     def test_row_that_cannot_be_created_still_reads_as_expired(self):
         db = FakeSupabase()

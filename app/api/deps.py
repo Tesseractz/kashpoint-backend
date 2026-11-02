@@ -1,10 +1,9 @@
-import time
 from typing import Optional
 
 from fastapi import Header, HTTPException, status
 
 from app.core.auth import verify_supabase_jwt
-from app.db.supabase import get_supabase_client
+from app.db.supabase import get_supabase_client, retry_transient
 from app.services.subscriptions import ensure_store_subscription
 
 
@@ -13,43 +12,6 @@ class RequestContext:
         self.user_id = user_id
         self.store_id = store_id
         self.role = role
-
-
-# A fresh account's first page load fires several requests at once, and the
-# shared Supabase client answers some of them with transient transport errors
-# ("[Errno 11] Resource temporarily unavailable", timeouts, dropped
-# connections). Those deserve a short retry; anything else is a real error.
-_TRANSIENT_MARKERS = (
-    "errno 11",
-    "resource temporarily unavailable",
-    "timed out",
-    "timeout",
-    "connection reset",
-    "connection aborted",
-    "server disconnected",
-    "remote protocol error",
-    "readerror",
-    "writeerror",
-    "connecterror",
-)
-RETRY_ATTEMPTS = 4
-RETRY_BASE_DELAY = 0.2
-
-
-def _is_transient(err: Exception) -> bool:
-    text = f"{type(err).__name__} {err}".lower()
-    return any(marker in text for marker in _TRANSIENT_MARKERS)
-
-
-def _retry(op):
-    """Run op(), retrying transient transport errors with a short backoff."""
-    for attempt in range(RETRY_ATTEMPTS):
-        try:
-            return op()
-        except Exception as e:
-            if not _is_transient(e) or attempt == RETRY_ATTEMPTS - 1:
-                raise
-            time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
 
 
 def _create_store_and_profile(supa, user_id: str, user_metadata: dict) -> dict:
@@ -78,17 +40,17 @@ def _create_store_and_profile(supa, user_id: str, user_metadata: dict) -> dict:
         rows = getattr(res, "data", None) or []
         return rows[0]["id"] if rows else None
 
-    store_id = _retry(find_store)
+    store_id = retry_transient(find_store)
     if not store_id:
         try:
-            res = _retry(
+            res = retry_transient(
                 lambda: supa.table("stores").insert({"name": store_name, "owner_id": user_id}).execute()
             )
             rows = getattr(res, "data", None) or []
             store_id = rows[0]["id"] if rows else None
         except Exception:
             # Another request of the same burst may have created it meanwhile.
-            store_id = _retry(find_store)
+            store_id = retry_transient(find_store)
             if not store_id:
                 raise
     if not store_id:
@@ -112,12 +74,12 @@ def _create_store_and_profile(supa, user_id: str, user_metadata: dict) -> dict:
         return rows[0] if rows else None
 
     try:
-        row = _retry(write_profile)
+        row = retry_transient(write_profile)
     except Exception:
         row = None
     if row is None:
         # ignore-duplicates returns nothing when the profile already existed.
-        row = _retry(read_profile)
+        row = retry_transient(read_profile)
     if not row:
         raise HTTPException(status_code=500, detail="Failed to create profile")
 
@@ -125,7 +87,7 @@ def _create_store_and_profile(supa, user_id: str, user_metadata: dict) -> dict:
     # the request: the profile exists now, and get_store_plan creates the
     # trial on the next read if this attempt does not get there either.
     try:
-        _retry(lambda: ensure_store_subscription(supa, store_id))
+        retry_transient(lambda: ensure_store_subscription(supa, store_id))
     except Exception as e:
         print(f"[signup] store {store_id}: trial subscription not created yet: {e!r}")
 
@@ -149,7 +111,9 @@ def get_current_context(authorization: Optional[str] = Header(None)) -> RequestC
     supa = get_supabase_client()
 
     try:
-        prof_result = supa.table("profiles").select("*").eq("id", user_id).execute()
+        prof_result = retry_transient(
+            lambda: supa.table("profiles").select("*").eq("id", user_id).execute()
+        )
     except Exception as e:
         print(f"[get_current_context] Error querying profiles: {e}")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
