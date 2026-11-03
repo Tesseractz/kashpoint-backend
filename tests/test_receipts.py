@@ -6,6 +6,7 @@ multi-item sale, under the name "KashPoint", and went out via a Brevo
 account that was never activated ("API Key is not enabled").
 """
 import smtplib
+import socket
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -362,6 +363,10 @@ class TestMailer:
         monkeypatch.setenv("SMTP_USER", "noreply@example.co.za")
         monkeypatch.setenv("SMTP_PASSWORD", "pw")
         monkeypatch.setenv("BREVO_API_KEY", "also-set")
+        monkeypatch.delenv("MAIL_RELAY_URL", raising=False)
+        mailer.reset_transport_state()
+        yield
+        mailer.reset_transport_state()
 
     def test_the_mailbox_wins_over_brevo(self):
         assert mailer.transport() == "smtp"
@@ -406,6 +411,48 @@ class TestMailer:
         with patch("httpx.post", return_value=resp):
             result = mailer.send_email("a@b.co", "s", "<p>x</p>")
         assert not result.success and "not activated" in result.message
+
+    # -- Render's free plan: the mail ports are blocked, the HTTPS relay is not.
+    def test_a_blocked_mail_port_falls_back_to_the_relay_with_the_same_login(self):
+        relay = MagicMock(status_code=200, content=b"x")
+        relay.json.return_value = {"ok": True}
+        with patch("smtplib.SMTP_SSL", side_effect=socket.timeout("timed out")), patch("httpx.post", return_value=relay) as post:
+            result = mailer.send_email("naledi@example.com", "Receipt #1", "<p>Hi</p>", from_name="Kj via KashPoint", reply_to="kj@example.com")
+        assert result.success, result.message
+        url = post.call_args.args[0]
+        body = post.call_args.kwargs["json"]
+        assert url == mailer.DEFAULT_RELAY_URL
+        assert body["user"] == "noreply@example.co.za" and body["password"] == "pw"
+        assert body["host"] == "mail.example.co.za" and body["port"] == 465
+        assert body["to"] == "naledi@example.com" and body["from_name"] == "Kj via KashPoint" and body["reply_to"] == "kj@example.com"
+        assert body["html"] == "<p>Hi</p>" and body["text"] == "Hi"
+
+    def test_after_one_timeout_the_process_skips_straight_to_the_relay(self):
+        relay = MagicMock(status_code=200, content=b"x")
+        relay.json.return_value = {"ok": True}
+        with patch("smtplib.SMTP_SSL", side_effect=socket.timeout("timed out")) as direct, patch("httpx.post", return_value=relay):
+            mailer.send_email("a@b.co", "s", "<p>x</p>")
+            mailer.send_email("a@b.co", "s", "<p>x</p>")
+        assert direct.call_count == 1
+
+    def test_a_refused_login_never_goes_to_the_relay(self):
+        with patch("smtplib.SMTP_SSL") as ssl_cls, patch("httpx.post") as post:
+            ssl_cls.return_value.__enter__.return_value.login.side_effect = smtplib.SMTPAuthenticationError(535, b"bad")
+            result = mailer.send_email("a@b.co", "s", "<p>x</p>")
+        assert not result.success and not post.called
+
+    def test_the_relays_own_errors_reach_the_cashier(self):
+        relay = MagicMock(status_code=401, content=b"x")
+        relay.json.return_value = {"ok": False, "error": "Mailbox login failed: check SMTP_USER and SMTP_PASSWORD."}
+        with patch("smtplib.SMTP_SSL", side_effect=socket.timeout("timed out")), patch("httpx.post", return_value=relay):
+            result = mailer.send_email("a@b.co", "s", "<p>x</p>")
+        assert not result.success and "login failed" in result.message
+
+    def test_relay_can_be_switched_off(self, monkeypatch):
+        monkeypatch.setenv("MAIL_RELAY_URL", "")
+        with patch("smtplib.SMTP_SSL", side_effect=socket.timeout("timed out")), patch("httpx.post") as post:
+            result = mailer.send_email("a@b.co", "s", "<p>x</p>")
+        assert not result.success and not post.called
 
     def test_html_to_text(self):
         assert mailer.html_to_text("<h1>Hi</h1><p>Total: <b>R 5</b></p>Bye<br>End") == "Hi\nTotal: R 5\nBye\nEnd"

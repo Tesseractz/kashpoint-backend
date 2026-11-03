@@ -12,10 +12,17 @@ with "API Key is not enabled", which is what receipts died of before.
 
 Every message carries a Message-ID and a plain-text part: mail without them
 is what spam filters are built to catch.
+
+Render's free instances cannot open the mail ports at all (25, 465, 587 are
+blocked outbound), so when the mail server cannot be reached the same
+message goes over HTTPS to a small relay on the web host next to the
+mailbox (frontend/public/mail/relay.php), which speaks SMTP from there. The
+relay authenticates with the same mailbox login; nothing extra to configure.
 """
 import os
 import re
 import smtplib
+import socket
 import ssl
 from email.message import EmailMessage
 from email.utils import formataddr, formatdate, make_msgid
@@ -23,6 +30,27 @@ from typing import Optional
 
 import httpx
 from pydantic import BaseModel
+
+DEFAULT_RELAY_URL = "https://app.kashpoint.co.za/mail/relay.php"
+# Seconds to wait for the mail server before deciding this host can't reach
+# it. A blocked port drops packets rather than refusing, so this is what a
+# Render instance actually waits.
+DIRECT_CONNECT_TIMEOUT = 8
+# Once a direct connection has timed out, this process goes straight to the
+# relay: the block does not come and go.
+_direct_smtp_blocked = False
+
+
+def relay_url() -> str:
+    value = os.getenv("MAIL_RELAY_URL")
+    if value is None:
+        return DEFAULT_RELAY_URL
+    return value.strip()  # set it empty to disable the relay
+
+
+def reset_transport_state() -> None:
+    global _direct_smtp_blocked
+    _direct_smtp_blocked = False
 
 
 class SendResult(BaseModel):
@@ -89,6 +117,7 @@ def send_email(
 
 
 def _send_smtp(to_email, subject, html_body, *, text_body, from_name, reply_to) -> SendResult:
+    global _direct_smtp_blocked
     host = os.getenv("SMTP_HOST", "").strip()
     user = os.getenv("SMTP_USER", "").strip()
     password = os.getenv("SMTP_PASSWORD", "")
@@ -98,38 +127,89 @@ def _send_smtp(to_email, subject, html_body, *, text_body, from_name, reply_to) 
         port = 465
     from_email = (os.getenv("SMTP_FROM") or user).strip()
     display = (from_name or os.getenv("SMTP_FROM_NAME") or "KashPoint").strip()
+    text = text_body or html_to_text(html_body)
 
-    msg = EmailMessage()
-    msg["From"] = formataddr((display, from_email))
-    msg["To"] = to_email
-    msg["Subject"] = subject
-    msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid(domain=from_email.rsplit("@", 1)[-1] or None)
-    if reply_to:
-        msg["Reply-To"] = reply_to
-    msg.set_content(text_body or html_to_text(html_body))
-    msg.add_alternative(html_body, subtype="html")
+    if not _direct_smtp_blocked:
+        msg = EmailMessage()
+        msg["From"] = formataddr((display, from_email))
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg["Date"] = formatdate(localtime=True)
+        msg["Message-ID"] = make_msgid(domain=from_email.rsplit("@", 1)[-1] or None)
+        if reply_to:
+            msg["Reply-To"] = reply_to
+        msg.set_content(text)
+        msg.add_alternative(html_body, subtype="html")
 
+        try:
+            if port == 465:
+                with smtplib.SMTP_SSL(host, port, timeout=DIRECT_CONNECT_TIMEOUT, context=ssl.create_default_context()) as smtp:
+                    smtp.login(user, password)
+                    smtp.send_message(msg)
+            else:
+                with smtplib.SMTP(host, port, timeout=DIRECT_CONNECT_TIMEOUT) as smtp:
+                    smtp.starttls(context=ssl.create_default_context())
+                    smtp.login(user, password)
+                    smtp.send_message(msg)
+            print(f"[mail] sent via SMTP to {to_email}: {subject}")
+            return SendResult(success=True, message="Email sent successfully", recipient=to_email)
+        except smtplib.SMTPAuthenticationError:
+            print(f"[mail] SMTP login refused for {user} at {host}:{port}")
+            return SendResult(success=False, message="Email login failed: check SMTP_USER and SMTP_PASSWORD.", recipient=to_email)
+        except smtplib.SMTPRecipientsRefused:
+            return SendResult(success=False, message=f"The mail server refused the address {to_email}.", recipient=to_email)
+        except smtplib.SMTPException as e:
+            # The server answered, and said no: the relay would hear the same.
+            print(f"[mail] SMTP send to {to_email} failed: {e!r}")
+            return SendResult(success=False, message=f"Email could not be sent: {e}", recipient=to_email)
+        except (socket.timeout, TimeoutError, ConnectionError, socket.gaierror, OSError) as e:
+            # Could not reach the mail server at all. On Render's free plan
+            # the mail ports are blocked, so this is the normal path there.
+            if not relay_url():
+                print(f"[mail] cannot reach {host}:{port} ({e!r}) and no relay is configured")
+                return SendResult(success=False, message=f"Email could not be sent: {e}", recipient=to_email)
+            _direct_smtp_blocked = True
+            print(f"[mail] cannot reach {host}:{port} ({e!r}); using the HTTPS relay from now on")
+
+    return _send_via_relay(
+        to_email, subject, html_body, text=text, display=display, reply_to=reply_to,
+        host=host, port=port, user=user, password=password,
+    )
+
+
+def _send_via_relay(to_email, subject, html_body, *, text, display, reply_to, host, port, user, password) -> SendResult:
+    url = relay_url()
+    if not url:
+        return SendResult(success=False, message="Email could not be sent: the mail server is unreachable and no relay is configured.", recipient=to_email)
+    payload = {
+        "user": user,
+        "password": password,
+        "host": host,
+        "port": port,
+        "to": to_email,
+        "subject": subject,
+        "html": html_body,
+        "text": text,
+        "from_name": display,
+        "reply_to": reply_to or "",
+    }
     try:
-        if port == 465:
-            with smtplib.SMTP_SSL(host, port, timeout=25, context=ssl.create_default_context()) as smtp:
-                smtp.login(user, password)
-                smtp.send_message(msg)
-        else:
-            with smtplib.SMTP(host, port, timeout=25) as smtp:
-                smtp.starttls(context=ssl.create_default_context())
-                smtp.login(user, password)
-                smtp.send_message(msg)
-    except smtplib.SMTPAuthenticationError:
-        print(f"[mail] SMTP login refused for {user} at {host}:{port}")
-        return SendResult(success=False, message="Email login failed: check SMTP_USER and SMTP_PASSWORD.", recipient=to_email)
-    except smtplib.SMTPRecipientsRefused:
-        return SendResult(success=False, message=f"The mail server refused the address {to_email}.", recipient=to_email)
-    except (smtplib.SMTPException, OSError) as e:
-        print(f"[mail] SMTP send to {to_email} failed: {e!r}")
-        return SendResult(success=False, message=f"Email could not be sent: {e}", recipient=to_email)
-    print(f"[mail] sent via SMTP to {to_email}: {subject}")
-    return SendResult(success=True, message="Email sent successfully", recipient=to_email)
+        response = httpx.post(url, json=payload, timeout=40.0)
+    except httpx.TimeoutException:
+        return SendResult(success=False, message="Email sending timed out. Please try again.", recipient=to_email)
+    except Exception as e:
+        print(f"[mail] relay {url} unreachable: {e!r}")
+        return SendResult(success=False, message="Email could not be sent: the mail relay is unreachable.", recipient=to_email)
+    try:
+        body = response.json() if response.content else {}
+    except Exception:
+        body = {}
+    if response.status_code == 200 and body.get("ok"):
+        print(f"[mail] sent via relay to {to_email}: {subject}")
+        return SendResult(success=True, message="Email sent successfully", recipient=to_email)
+    error = body.get("error") if isinstance(body, dict) else None
+    print(f"[mail] relay refused ({response.status_code}): {error or response.text[:120]}")
+    return SendResult(success=False, message=error or f"Email could not be sent (relay HTTP {response.status_code}).", recipient=to_email)
 
 
 def _send_brevo(to_email, subject, html_body, *, text_body, from_name, reply_to) -> SendResult:
