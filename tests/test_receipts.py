@@ -424,6 +424,7 @@ class TestMailer:
         assert "json" not in post.call_args.kwargs
         body = post.call_args.kwargs["data"]
         assert url == mailer.DEFAULT_RELAY_URL
+        assert post.call_args.kwargs["headers"]["User-Agent"].startswith("KashPoint-API/")
         assert body["user"] == "noreply@example.co.za" and body["password"] == "pw"
         assert body["host"] == "mail.example.co.za" and body["port"] == 465
         assert body["to"] == "naledi@example.com" and body["from_name"] == "Kj via KashPoint" and body["reply_to"] == "kj@example.com"

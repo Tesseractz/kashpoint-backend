@@ -32,6 +32,9 @@ import httpx
 from pydantic import BaseModel
 
 DEFAULT_RELAY_URL = "https://app.kashpoint.co.za/mail/relay.php"
+# The web host drops requests from clients that only say "python-httpx";
+# the API identifies itself by name, as any server-to-server client should.
+RELAY_USER_AGENT = "KashPoint-API/1.0 (+https://kashpoint.co.za)"
 # Seconds to wait for the mail server before deciding this host can't reach
 # it. A blocked port drops packets rather than refusing, so this is what a
 # Render instance actually waits.
@@ -195,7 +198,7 @@ def _send_via_relay(to_email, subject, html_body, *, text, display, reply_to, ho
     }
     # An ordinary form post: the web host answers 406 to requests sent as JSON.
     try:
-        response = httpx.post(url, data=payload, timeout=40.0)
+        response = httpx.post(url, data=payload, headers={"User-Agent": RELAY_USER_AGENT}, timeout=40.0)
     except httpx.TimeoutException:
         return SendResult(success=False, message="Email sending timed out. Please try again.", recipient=to_email)
     except Exception as e:
