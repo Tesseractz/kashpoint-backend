@@ -193,8 +193,9 @@ def _send_via_relay(to_email, subject, html_body, *, text, display, reply_to, ho
         "from_name": display,
         "reply_to": reply_to or "",
     }
+    # An ordinary form post: the web host answers 406 to requests sent as JSON.
     try:
-        response = httpx.post(url, json=payload, timeout=40.0)
+        response = httpx.post(url, data=payload, timeout=40.0)
     except httpx.TimeoutException:
         return SendResult(success=False, message="Email sending timed out. Please try again.", recipient=to_email)
     except Exception as e:

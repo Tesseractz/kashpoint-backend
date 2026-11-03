@@ -420,7 +420,9 @@ class TestMailer:
             result = mailer.send_email("naledi@example.com", "Receipt #1", "<p>Hi</p>", from_name="Kj via KashPoint", reply_to="kj@example.com")
         assert result.success, result.message
         url = post.call_args.args[0]
-        body = post.call_args.kwargs["json"]
+        # An ordinary form post: the web host answers 406 to JSON requests.
+        assert "json" not in post.call_args.kwargs
+        body = post.call_args.kwargs["data"]
         assert url == mailer.DEFAULT_RELAY_URL
         assert body["user"] == "noreply@example.co.za" and body["password"] == "pw"
         assert body["host"] == "mail.example.co.za" and body["port"] == 465
