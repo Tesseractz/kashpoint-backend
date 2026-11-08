@@ -11,6 +11,13 @@ def log_audit_event(
     resource_id: str = None,
     details: str = None,
 ):
+    """Record a store-level change (product edited, user invited...).
+
+    The table's columns are entity_type / entity_id / created_at (see
+    backend/scripts/migrations.sql); the callers' vocabulary of resource_type /
+    resource_id / timestamp is mapped here. Writing the callers' names, as this
+    did before, failed on every call and left the audit log empty.
+    """
     try:
         supabase = supabase_client.get_supabase_client()
         limits = subscriptions.get_store_plan(store_id)
@@ -20,10 +27,10 @@ def log_audit_event(
                     "store_id": store_id,
                     "user_id": user_id,
                     "action": action,
-                    "resource_type": resource_type,
-                    "resource_id": resource_id,
+                    "entity_type": resource_type,
+                    "entity_id": None if resource_id is None else str(resource_id),
                     "details": details,
-                    "timestamp": now_utc_iso(),
+                    "created_at": now_utc_iso(),
                 }
             ).execute()
     except Exception:

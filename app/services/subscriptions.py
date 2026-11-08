@@ -70,12 +70,24 @@ class PlanLimits:
         trial_end: Optional[str] = None,
         current_period_end: Optional[str] = None,
         has_card: bool = False,
+        comp_until: Optional[str] = None,
+        suspended_at: Optional[str] = None,
     ):
         normalized_plan = "pro" if plan == "business" else plan
+        # Staff overrides from the admin portal. Neither is touched by Paystack:
+        # a suspension outranks everything, a complimentary period grants Pro
+        # whatever the billing state says.
+        self.suspended = bool(suspended_at)
+        self.comp_until = comp_until
+        self._comp_active = self._check_comp_active()
+        if self._comp_active:
+            normalized_plan = "pro"
         self.plan = normalized_plan
         st = status
         if normalized_plan in ("pro", "business") and st == "trialing" and not trial_end:
             st = "active"
+        if self.suspended:
+            st = "suspended"
         self.status = st
         self.trial_end = trial_end
         self.current_period_end = current_period_end
@@ -86,6 +98,12 @@ class PlanLimits:
         self.degraded = False
         self._is_trial_active = self._check_trial_active()
         self._period_expired = self._check_period_expired()
+
+    def _check_comp_active(self) -> bool:
+        if self.suspended:
+            return False
+        until = _parse_iso(self.comp_until)
+        return bool(until) and datetime.now(timezone.utc) < until
 
     def _check_trial_active(self) -> bool:
         if self.status != "trialing":
@@ -122,6 +140,10 @@ class PlanLimits:
 
     @property
     def is_active(self) -> bool:
+        if self.suspended:
+            return False
+        if self._comp_active:
+            return True
         paid_plan = self.plan in ("pro", "business")
         if self.status == "active" and paid_plan:
             # Nothing ever expires a subscription on a timer, so a lapsed
@@ -143,7 +165,7 @@ class PlanLimits:
 
     @property
     def is_on_trial(self) -> bool:
-        return self.status == "trialing" and self._is_trial_active
+        return self.status == "trialing" and self._is_trial_active and not self.suspended
 
     @property
     def max_products(self) -> Optional[int]:
@@ -199,6 +221,8 @@ def _limits_from_row(data: dict) -> PlanLimits:
         trial_end=data.get("trial_end"),
         current_period_end=data.get("current_period_end"),
         has_card=bool(data.get("paystack_subscription_code")),
+        comp_until=data.get("comp_until"),
+        suspended_at=data.get("suspended_at"),
     )
 
 
@@ -299,6 +323,10 @@ def get_plan_info(store_id: str) -> dict:
         "card_on_file": bool(sub_data.get("paystack_subscription_code"))
         and (sub_data.get("status") in ("trialing", "active", "past_due")),
         "billing_provider": sub_data.get("billing_provider"),
+        # Staff overrides (admin portal): Pro on the house until a date, or a
+        # lock-out the owner cannot lift by paying.
+        "comp_until": sub_data.get("comp_until"),
+        "suspended": bool(sub_data.get("suspended_at")),
         "limits": {
             "max_products": limits.max_products,
             "max_users": limits.max_users,

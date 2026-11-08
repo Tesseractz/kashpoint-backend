@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 import app.services.analytics as analytics_mod
+import app.services.platform_admin as platform_admin
 import app.services.subscriptions as subscriptions
 import app.db.supabase as supabase_client
 from app.services.analytics import AnalyticsSummary
@@ -12,6 +13,19 @@ from app.services.store_profile import empty_profile, read_store
 from app.api.deps import RequestContext, get_current_context
 
 router = APIRouter()
+
+
+def _platform_fields(supabase, ctx: RequestContext) -> dict:
+    """Whether this account may open the admin portal, and as what. The
+    client only uses it to show the link; every /admin route checks again."""
+    try:
+        admin = platform_admin.lookup_platform_admin(supabase, ctx.user_id, ctx.email)
+    except Exception:
+        admin = None
+    return {
+        "platform_role": admin.role if admin else None,
+        "partner_id": admin.partner_id if admin else None,
+    }
 
 
 @router.get("/profile")
@@ -35,6 +49,7 @@ def get_profile(ctx: RequestContext = Depends(get_current_context)):
                 "store_name": store.get("name"),
                 # The receipt profile: logo, address, VAT number, footer...
                 "store": store,
+                **_platform_fields(supabase, ctx),
             }
         else:
             return {
@@ -44,6 +59,7 @@ def get_profile(ctx: RequestContext = Depends(get_current_context)):
                 "store_id": ctx.store_id,
                 "store_name": None,
                 "store": empty_profile(ctx.store_id),
+                **_platform_fields(supabase, ctx),
             }
     except Exception as e:
         print(f"[Profile API] Error fetching profile: {e}")
@@ -54,6 +70,8 @@ def get_profile(ctx: RequestContext = Depends(get_current_context)):
             "store_id": ctx.store_id,
             "store_name": None,
             "store": empty_profile(ctx.store_id),
+            "platform_role": None,
+            "partner_id": None,
         }
 
 
@@ -123,11 +141,24 @@ def get_audit_logs(limit: int = 50, ctx: RequestContext = Depends(get_current_co
             supabase.table("audit_logs")
             .select("*")
             .eq("store_id", ctx.store_id)
-            .order("timestamp", desc=True)
+            .order("created_at", desc=True)
             .limit(limit)
             .execute()
         )
-        return res.data or []
+        # The table stores entity_type / entity_id / created_at; the API has
+        # always answered with resource_type / resource_id / timestamp.
+        return [
+            {
+                "id": row.get("id"),
+                "user_id": row.get("user_id") or "",
+                "action": row.get("action") or "",
+                "resource_type": row.get("resource_type") or row.get("entity_type") or "",
+                "resource_id": row.get("resource_id") or row.get("entity_id"),
+                "details": row.get("details"),
+                "timestamp": row.get("timestamp") or row.get("created_at"),
+            }
+            for row in (res.data or [])
+        ]
     except Exception as e:
         return []
 

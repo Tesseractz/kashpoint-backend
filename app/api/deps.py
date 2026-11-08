@@ -9,10 +9,11 @@ from app.services.subscriptions import ensure_store_subscription
 
 
 class RequestContext:
-    def __init__(self, user_id: str, store_id: str, role: str):
+    def __init__(self, user_id: str, store_id: str, role: str, email: Optional[str] = None):
         self.user_id = user_id
         self.store_id = store_id
         self.role = role
+        self.email = email
 
 
 def _missing_column(err: Exception, column: str) -> bool:
@@ -21,21 +22,47 @@ def _missing_column(err: Exception, column: str) -> bool:
     return f"'{column}'" in text and ("PGRST204" in text or "column" in text.lower())
 
 
-def _insert_store(supa, payload: dict):
-    """Insert the store, dropping `phone` if the column hasn't been added yet.
+# Columns later migrations add to `stores`. A signup must never fail over one
+# of them being absent: the phone number is also in the user's auth metadata,
+# and a partner link can be set from the admin portal afterwards.
+OPTIONAL_STORE_COLUMNS = ("phone", "partner_id")
 
-    The phone number is also kept in the user's auth metadata, so nothing is
-    lost while the stores.phone migration is pending; signups must never fail
-    over it.
+
+def _insert_store(supa, payload: dict):
+    """Insert the store, dropping optional columns the table doesn't have yet."""
+    current = dict(payload)
+    for _ in range(len(OPTIONAL_STORE_COLUMNS)):
+        try:
+            return supa.table("stores").insert(current).execute()
+        except Exception as e:
+            missing = [c for c in OPTIONAL_STORE_COLUMNS if c in current and _missing_column(e, c)]
+            if not missing:
+                raise
+            print(f"[signup] stores.{missing[0]} column missing; saving the store without it")
+            current = {k: v for k, v in current.items() if k not in missing}
+    return supa.table("stores").insert(current).execute()
+
+
+def _partner_id_for_code(supa, code) -> Optional[str]:
+    """The partner a signup code belongs to, or None.
+
+    The code is what a computer shop gives the stores it sets up, so their
+    stores appear in that partner's view of the admin portal. A wrong or
+    unknown code never blocks a signup: the store is created without a partner
+    and staff can link it later.
     """
+    code = str(code or "").strip().upper()
+    if not code:
+        return None
     try:
-        return supa.table("stores").insert(payload).execute()
+        res = supa.table("partners").select("id").eq("code", code).limit(1).execute()
+        rows = getattr(res, "data", None) or []
+        if rows:
+            return rows[0]["id"]
+        print(f"[signup] unknown partner code {code!r}; store created without a partner")
     except Exception as e:
-        if "phone" in payload and _missing_column(e, "phone"):
-            print("[signup] stores.phone column missing; saving the store without it")
-            rest = {k: v for k, v in payload.items() if k != "phone"}
-            return supa.table("stores").insert(rest).execute()
-        raise
+        print(f"[signup] partner lookup for {code!r} failed: {e!r}")
+    return None
 
 
 def _create_store_and_profile(supa, user_id: str, user_metadata: dict) -> dict:
@@ -55,6 +82,9 @@ def _create_store_and_profile(supa, user_id: str, user_metadata: dict) -> dict:
     phone = normalize_phone(user_metadata.get("phone"))
     if phone:
         store_payload["phone"] = phone
+    partner_id = _partner_id_for_code(supa, user_metadata.get("partner_code"))
+    if partner_id:
+        store_payload["partner_id"] = partner_id
 
     def find_store() -> Optional[str]:
         res = (
@@ -179,4 +209,4 @@ def get_current_context(authorization: Optional[str] = Header(None)) -> RequestC
     if not store_id:
         raise HTTPException(status_code=500, detail="Profile missing store_id")
 
-    return RequestContext(user_id=user_id, store_id=store_id, role=role)
+    return RequestContext(user_id=user_id, store_id=store_id, role=role, email=payload.get("email"))
