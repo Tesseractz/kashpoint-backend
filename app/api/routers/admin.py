@@ -342,6 +342,10 @@ def store_detail(store_id: str, admin: PlatformAdmin = Depends(get_platform_admi
 
     sub = dict(snap.subs.get(store_id) or {})
     sub.pop("paystack_email_token", None)
+    if not admin.is_owner:
+        # A partner sees where the store stands, not its billing identifiers.
+        for key in ("paystack_customer_code", "paystack_subscription_code"):
+            sub.pop(key, None)
 
     all_sales = _rows(supa.table("sales").select("id,total_price").eq("store_id", store_id).execute())
     customers = _rows(supa.table("customers").select("id").eq("store_id", store_id).execute())

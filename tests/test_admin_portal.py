@@ -376,9 +376,15 @@ class TestStoresList:
         assert all(i["admin_notes"] is None for i in body["items"])
         assert body["partners"] == []
 
-    def test_partner_cannot_open_another_partners_store(self, partner):
+    def test_partner_cannot_open_another_partners_store(self, partner, db):
         assert partner.get("/admin/stores/s_pay").status_code == 404
-        assert partner.get("/admin/stores/s_trial").status_code == 200
+        next(r for r in db.rows("subscriptions") if r["store_id"] == "s_trial")["paystack_customer_code"] = "CUS_x"
+        res = partner.get("/admin/stores/s_trial")
+        assert res.status_code == 200
+        # Where the store stands, yes; its billing identifiers and staff notes, no.
+        assert "paystack_customer_code" not in res.json()["subscription"]
+        assert res.json()["actions"] == []
+        assert "admin_notes" not in res.json()["store"]
 
     def test_store_detail(self, owner):
         res = owner.get("/admin/stores/s_pay")
