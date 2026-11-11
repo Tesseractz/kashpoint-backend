@@ -219,6 +219,105 @@ def _switch_off_as_owner(owner, db):
     assert owner.delete("/airtime/account").status_code == 409
 
 
+CATALOG = [
+    {"product_id": 14, "voucher_type": "Shoprite", "slug": "shoprite", "available_amounts": [100, 110, 200], "logo_url": "https://simcloud.co.za/l/shoprite.png"},
+    {"product_id": 3, "voucher_type": "Golfers Club", "slug": "golfers-club", "available_amounts": [500]},
+    {"product_id": 10, "voucher_type": "PEP", "slug": "pep", "available_amounts": [250], "logo_url": "javascript:alert(1)"},
+]
+
+
+def test_electricity_fee_matches_simclouds_example():
+    assert simcloud.electricity_fee(150) == 4   # their example: R150 -> R4 fee, R146 electricity
+    assert simcloud.electricity_fee(55) == 1
+    assert simcloud.electricity_fee(1000) == 10  # capped
+
+
+def test_meter_check(cashier, db):
+    _activate(db)
+    with patch("app.clients.simcloud.electricity_meter", return_value={"status": "success", "supported": True, "provider": "City Power"}):
+        body = cashier.get("/airtime/electricity/meter", params={"meter_number": "0123 4567 890"}).json()
+    assert body == {"meter_number": "01234567890", "status": "success", "supported": True, "provider": "City Power"}
+    with patch("app.clients.simcloud.electricity_meter", side_effect=SimcloudError("down", status=503)):
+        assert cashier.get("/airtime/electricity/meter", params={"meter_number": "01234567890"}).json()["status"] == "unknown"
+    assert cashier.get("/airtime/electricity/meter", params={"meter_number": "12"}).status_code == 400
+
+
+def test_selling_electricity_records_the_token_and_both_fees(cashier, db):
+    _activate(db)
+    db.rows("airtime_accounts")[0]["electricity_fee"] = 3
+    answer = {"status": "success", "order_id": 501, "recharge_pin_information": [{"entry_order": 1, "pin": "1234 5678 9012 3456 7890"}]}
+    with patch("app.clients.simcloud.order_electricity", return_value=answer) as order:
+        res = cashier.post("/airtime/sell", json={"kind": "electricity", "meter_number": "01234567890", "amount": 150, "msisdn": "083 555 0000"})
+    assert res.status_code == 200, res.text
+    kw = order.call_args.kwargs
+    assert kw["meter_number"] == "01234567890" and kw["amount"] == 150 and kw["recipient"] == "0835550000"
+    sale = db.rows("airtime_sales")[0]
+    assert kw["client_reference"] == sale["reference"]
+    assert sale["kind"] == "electricity" and sale["status"] == "delivered"
+    assert sale["service_fee"] == 3.0 and sale["provider_fee"] == 4.0
+    assert sale["details"]["tokens"] == ["12345678901234567890"] and sale["details"]["meter_number"] == "01234567890"
+
+
+def test_electricity_validation(cashier, db):
+    _activate(db)
+    with patch("app.clients.simcloud.order_electricity") as order:
+        base = {"kind": "electricity", "meter_number": "01234567890", "msisdn": "0835550000"}
+        assert cashier.post("/airtime/sell", json={**base, "amount": 50}).status_code == 400
+        assert cashier.post("/airtime/sell", json={**base, "amount": 99.5}).status_code == 400
+        assert cashier.post("/airtime/sell", json={**base, "amount": 100, "msisdn": ""}).status_code == 400
+        assert cashier.post("/airtime/sell", json={**base, "amount": 100, "meter_number": "1"}).status_code == 400
+    order.assert_not_called()
+
+
+def test_pending_electricity_gets_its_token_on_refresh_without_buying_again(owner, db):
+    _activate(db)
+    db.add("airtime_sales", id=7, store_id="s1", kind="electricity", network="electricity", msisdn="0835550000", amount=100.0, service_fee=0,
+           reference="KP-e1", request_id="", status="pending", details={"meter_number": "01234567890", "tokens": []}, created_at="2026-11-11T10:00:00+00:00")
+    done = {"status": "success", "recharge_pin_information": {"pins": ["11112222333344445555"]}}
+    with patch("app.clients.simcloud.electricity_status", return_value=done) as st, patch("app.clients.simcloud.order_electricity") as order:
+        sale = owner.get("/airtime/sales/7").json()
+    assert st.call_args.args[1] == "KP-e1"
+    order.assert_not_called()
+    assert sale["status"] == "delivered" and sale["details"]["tokens"] == ["11112222333344445555"]
+
+
+def test_voucher_list_is_the_shop_friendly_subset(cashier, db):
+    _activate(db)
+    with patch("app.clients.simcloud.voucher_catalog", return_value=CATALOG):
+        items = cashier.get("/airtime/vouchers").json()["items"]
+    assert [i["name"] for i in items] == ["Shoprite", "PEP"]
+    assert items[0]["amounts"] == [100.0, 110.0, 200.0] and items[0]["logo_url"].startswith("https://")
+    assert items[1]["logo_url"] is None  # only https logos are passed on
+
+
+def test_selling_a_voucher_and_fetching_its_code(cashier, db):
+    _activate(db, fee=2)
+    with patch("app.clients.simcloud.voucher_catalog", return_value=CATALOG), patch(
+        "app.clients.simcloud.order_voucher", return_value={"order_id": 88, "process_status": "Pending", "fee": 0}
+    ) as order:
+        res = cashier.post("/airtime/sell", json={"kind": "voucher", "product_id": 14, "amount": 100})
+        assert res.status_code == 200, res.text
+        assert order.call_args.kwargs["product_id"] == 14 and order.call_args.kwargs["amount"] == 100
+        # An amount the brand doesn't sell, and a brand we don't list, never reach SIMcloud.
+        assert cashier.post("/airtime/sell", json={"kind": "voucher", "product_id": 14, "amount": 105}).status_code == 400
+        assert cashier.post("/airtime/sell", json={"kind": "voucher", "product_id": 3, "amount": 500}).status_code == 400
+        assert order.call_count == 1
+    sale = db.rows("airtime_sales")[0]
+    assert sale["kind"] == "voucher" and sale["network"] == "shoprite" and sale["status"] == "pending" and sale["service_fee"] == 2.0
+    sale["id"] = 1
+    ready = {"process_status": "Success", "vouchers": [{"voucher_type": "Shoprite", "voucher_code": "ABCD-1234", "value": 100, "expiry_date": "2029-11-11"}]}
+    with patch("app.clients.simcloud.voucher_status", return_value=ready):
+        got = cashier.get("/airtime/sales/1").json()
+    assert got["status"] == "delivered" and got["details"]["vouchers"][0]["voucher_code"] == "ABCD-1234"
+
+
+def test_electricity_fee_setting(owner, db):
+    _activate(db)
+    assert owner.put("/airtime/settings", json={"electricity_fee": 3}).json() == {"electricity_fee": 3}
+    assert db.rows("airtime_accounts")[0]["electricity_fee"] == 3
+    assert owner.put("/airtime/settings", json={}).status_code == 400
+
+
 def test_missing_tables_say_so(owner, db):
     del db.tables["airtime_accounts"]
     res = owner.post("/airtime/sell", json={"msisdn": "0835550000", "network": "mtn", "amount": 10})

@@ -7,6 +7,7 @@ the service fee it sets (charged to the customer on top of the airtime).
 
 There is no test mode at SIMcloud: every sale placed here is real.
 """
+import re
 import secrets
 import string
 from datetime import datetime, timezone
@@ -102,10 +103,17 @@ def status(ctx: RequestContext = Depends(get_current_context)):
         "activated": bool(account),
         "cell": account.get("cell") if account else None,
         "service_fee": float(account.get("service_fee") or 0) if account else 0,
+        "electricity_fee": float(account.get("electricity_fee") or 0) if account else 0,
         "balance": None,
         "balance_updated_at": None,
         "top_up": TOP_UP,
-        "limits": {"airtime_min": simcloud.AIRTIME_MIN, "airtime_max": simcloud.AIRTIME_MAX, "max_service_fee": MAX_SERVICE_FEE},
+        "limits": {
+            "airtime_min": simcloud.AIRTIME_MIN,
+            "airtime_max": simcloud.AIRTIME_MAX,
+            "electricity_min": simcloud.ELECTRICITY_MIN,
+            "electricity_max": simcloud.ELECTRICITY_MAX,
+            "max_service_fee": MAX_SERVICE_FEE,
+        },
         "networks": list(simcloud.AIRTIME_NETWORKS),
     }
     if account:
@@ -183,7 +191,8 @@ def activate(body: ActivateBody, ctx: RequestContext = Depends(get_current_conte
 
 
 class SettingsBody(BaseModel):
-    service_fee: float = Field(..., ge=0, le=MAX_SERVICE_FEE)
+    service_fee: Optional[float] = Field(None, ge=0, le=MAX_SERVICE_FEE)
+    electricity_fee: Optional[float] = Field(None, ge=0, le=MAX_SERVICE_FEE)
 
 
 @router.put("/settings")
@@ -191,9 +200,78 @@ def settings(body: SettingsBody, ctx: RequestContext = Depends(get_current_conte
     _admin(ctx)
     supa = supabase_client.get_supabase_client()
     _require_account(supa, ctx.store_id)
-    fee = round(body.service_fee, 2)
-    supa.table("airtime_accounts").update({"service_fee": fee}).eq("store_id", ctx.store_id).execute()
-    return {"service_fee": fee}
+    changes = {}
+    if body.service_fee is not None:
+        changes["service_fee"] = round(body.service_fee, 2)
+    if body.electricity_fee is not None:
+        changes["electricity_fee"] = round(body.electricity_fee, 2)
+    if not changes:
+        raise HTTPException(status_code=400, detail="Nothing to change.")
+    try:
+        supa.table("airtime_accounts").update(changes).eq("store_id", ctx.store_id).execute()
+    except Exception as e:
+        raise _schema_error(e)
+    return changes
+
+
+# Vouchers a neighbourhood shop can actually sell: groceries, clothing,
+# pharmacy, online shopping and rides. SIMcloud also lists restaurants and
+# speciality stores, which are left out.
+VOUCHER_SLUGS = (
+    "shoprite", "checkers", "usave", "pick-n-pay", "pep", "pep-home",
+    "woolworths", "takealot-com", "medirite", "bolt",
+)
+
+
+def _voucher_products(token: str) -> list:
+    try:
+        items = simcloud.voucher_catalog(token)
+    except SimcloudError as e:
+        raise _upstream(e)
+    out = []
+    for p in items:
+        if p.get("slug") not in VOUCHER_SLUGS:
+            continue
+        amounts = [float(a) for a in (p.get("available_amounts") or []) if a]
+        out.append(
+            {
+                "product_id": p.get("product_id"),
+                "name": p.get("voucher_type"),
+                "slug": p.get("slug"),
+                "amounts": amounts,
+                "logo_url": p.get("logo_url") if str(p.get("logo_url") or "").startswith("https://") else None,
+            }
+        )
+    out.sort(key=lambda p: VOUCHER_SLUGS.index(p["slug"]))
+    return out
+
+
+@router.get("/vouchers")
+def vouchers(ctx: RequestContext = Depends(get_current_context)):
+    supa = supabase_client.get_supabase_client()
+    account = _require_account(supa, ctx.store_id)
+    return {"items": _voucher_products(_token(account))}
+
+
+@router.get("/electricity/meter")
+def electricity_meter(meter_number: str, ctx: RequestContext = Depends(get_current_context)):
+    """Is this meter one SIMcloud can sell for, and whose is it? Free."""
+    meter = re.sub(r"\D", "", meter_number or "")
+    if not (8 <= len(meter) <= 20):
+        raise HTTPException(status_code=400, detail="A meter number is usually 11 digits.")
+    supa = supabase_client.get_supabase_client()
+    account = _require_account(supa, ctx.store_id)
+    try:
+        res = simcloud.electricity_meter(_token(account), meter)
+    except SimcloudError:
+        # "We could not check" is not "unsupported": let the cashier decide.
+        return {"meter_number": meter, "status": "unknown", "supported": None, "provider": None}
+    return {
+        "meter_number": meter,
+        "status": res.get("status"),
+        "supported": res.get("supported"),
+        "provider": res.get("provider"),
+    }
 
 
 @router.delete("/account")
@@ -256,22 +334,153 @@ def products(network: str = "", ctx: RequestContext = Depends(get_current_contex
 
 class SellBody(BaseModel):
     kind: str = "airtime"
-    msisdn: str
-    network: str
+    msisdn: Optional[str] = None
+    network: Optional[str] = None
     amount: float = Field(..., gt=0)
     description: Optional[str] = Field(None, max_length=120)
+    meter_number: Optional[str] = None
+    product_id: Optional[int] = None
+
+
+STATUS_WORDS = {"success": "delivered", "successful": "delivered", "completed": "delivered", "cancelled": "failed", "canceled": "failed"}
+
+
+def _status_word(*values) -> str:
+    """SIMcloud's words for where an order is, as one of ours:
+    queued | pending | delivered | failed."""
+    for v in values:
+        word = str(v or "").strip().lower()
+        if word:
+            return STATUS_WORDS.get(word, word)
+    return "pending"
+
+
+def _find_tokens(obj) -> list:
+    """Electricity tokens anywhere in SIMcloud's answer: runs of 16 to 24
+    digits, possibly spaced or dashed, in the order they appear (which is the
+    order they must be entered)."""
+    found = []
+
+    def walk(x):
+        if isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, (list, tuple)):
+            for v in x:
+                walk(v)
+        elif isinstance(x, (str, int)):
+            text = str(x).strip()
+            digits = re.sub(r"[\s-]", "", text)
+            if digits.isdigit() and 16 <= len(digits) <= 24 and digits not in found:
+                found.append(digits)
+
+    walk(obj)
+    return found
+
+
+def _electricity_details(res: dict, meter: str) -> dict:
+    return {
+        "meter_number": meter,
+        "tokens": _find_tokens(res.get("recharge_pin_information") or res),
+        "units": res.get("units") or res.get("kwh"),
+        "provider": res.get("provider"),
+    }
+
+
+def _record(supa, ctx, sale: dict) -> dict:
+    try:
+        rows = _rows(supa.table("airtime_sales").insert(sale).execute())
+        return rows[0] if rows else sale
+    except Exception as e:
+        # The purchase has gone through; losing the record must not look like a failed sale.
+        print(f"[airtime] store {ctx.store_id}: sale {sale.get('reference')} placed but not recorded: {e!r}")
+        return sale
+
+
+def _sell_electricity(supa, ctx, account: dict, body: SellBody) -> dict:
+    meter = re.sub(r"\D", "", body.meter_number or "")
+    if not (8 <= len(meter) <= 20):
+        raise HTTPException(status_code=400, detail="Enter the meter number, usually 11 digits.")
+    if body.amount != int(body.amount) or not (simcloud.ELECTRICITY_MIN <= body.amount <= simcloud.ELECTRICITY_MAX):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Electricity is sold in whole rands from R{simcloud.ELECTRICITY_MIN} to R{simcloud.ELECTRICITY_MAX}.",
+        )
+    recipient = simcloud.normalize_cell(body.msisdn)
+    if not recipient:
+        raise HTTPException(status_code=400, detail="Enter the customer's cell number: the token is also sent there by SMS.")
+    amount = int(body.amount)
+    reference = f"KP-{secrets.token_hex(6)}"
+    try:
+        res = simcloud.order_electricity(_token(account), meter_number=meter, amount=amount, client_reference=reference, recipient=recipient)
+    except SimcloudError as e:
+        raise _upstream(e)
+    return _record(supa, ctx, {
+        "store_id": ctx.store_id,
+        "sold_by": ctx.user_id,
+        "kind": "electricity",
+        "network": "electricity",
+        "msisdn": recipient,
+        "amount": float(amount),
+        "service_fee": float(account.get("electricity_fee") or 0),
+        "provider_fee": float(simcloud.electricity_fee(amount)),
+        "description": f"Electricity R{amount} for meter {meter}",
+        "reference": reference,
+        "request_id": str(res.get("order_id") or res.get("order_reference_id") or ""),
+        "status": _status_word(res.get("status")),
+        "details": _electricity_details(res, meter),
+        "created_at": _now(),
+        "updated_at": _now(),
+    })
+
+
+def _sell_voucher(supa, ctx, account: dict, body: SellBody) -> dict:
+    token = _token(account)
+    product = next((p for p in _voucher_products(token) if p["product_id"] == body.product_id), None)
+    if not product:
+        raise HTTPException(status_code=400, detail="Choose a voucher from the list.")
+    if product["amounts"] and float(body.amount) not in product["amounts"]:
+        raise HTTPException(status_code=400, detail=f"{product['name']} vouchers come in fixed amounts. Choose one from the list.")
+    recipient = simcloud.normalize_cell(body.msisdn) if body.msisdn else None
+    reference = f"KP-{secrets.token_hex(6)}"
+    amount = int(body.amount) if body.amount == int(body.amount) else body.amount
+    try:
+        res = simcloud.order_voucher(token, product_id=product["product_id"], amount=amount, reference=reference)
+    except SimcloudError as e:
+        raise _upstream(e)
+    return _record(supa, ctx, {
+        "store_id": ctx.store_id,
+        "sold_by": ctx.user_id,
+        "kind": "voucher",
+        "network": product["slug"],
+        "msisdn": recipient,
+        "amount": float(amount),
+        "service_fee": float(account.get("service_fee") or 0),
+        "provider_fee": float(res.get("fee") or 0),
+        "description": f"{product['name']} voucher R{amount}",
+        "reference": reference,
+        "request_id": str(res.get("order_id") or ""),
+        "status": _status_word(res.get("process_status"), res.get("status")),
+        "details": {"brand": product["name"], "vouchers": res.get("vouchers") or []},
+        "created_at": _now(),
+        "updated_at": _now(),
+    })
 
 
 @router.post("/sell")
 def sell(body: SellBody, ctx: RequestContext = Depends(get_current_context)):
-    """Send airtime or a data bundle to a phone, paid from the shop's wallet.
+    """Sell airtime, data, electricity or a voucher from the shop's wallet.
 
-    The customer pays the shop `amount + service_fee` at the till; only
+    The customer pays the shop `amount + service fee` at the till; only
     `amount` leaves the wallet.
     """
-    if body.kind not in ("airtime", "data"):
-        raise HTTPException(status_code=400, detail="Choose airtime or data.")
-    network = body.network.strip().lower()
+    if body.kind not in ("airtime", "data", "electricity", "voucher"):
+        raise HTTPException(status_code=400, detail="Choose airtime, data, electricity or a voucher.")
+    if body.kind in ("electricity", "voucher"):
+        supa = supabase_client.get_supabase_client()
+        account = _require_account(supa, ctx.store_id)
+        return _sell_electricity(supa, ctx, account, body) if body.kind == "electricity" else _sell_voucher(supa, ctx, account, body)
+    network = (body.network or "").strip().lower()
     if network not in simcloud.AIRTIME_NETWORKS:
         raise HTTPException(status_code=400, detail="Choose MTN, Vodacom, Cell C or Telkom.")
     msisdn = simcloud.normalize_cell(body.msisdn)
@@ -321,17 +530,35 @@ def sell(body: SellBody, ctx: RequestContext = Depends(get_current_context)):
 
 def _refresh(supa, account: dict, sale: dict) -> dict:
     """Ask SIMcloud where a sale that isn't final yet has got to."""
-    if sale.get("status") in FINAL_STATES or not sale.get("request_id"):
+    # Electricity is looked up by our own reference; the rest by SIMcloud's id.
+    if sale.get("status") in FINAL_STATES or not (sale.get("request_id") or sale.get("kind") == "electricity"):
         return sale
+    kind = sale.get("kind")
+    changes = {}
     try:
-        fn = simcloud.airtime_status if sale.get("kind") == "airtime" else simcloud.data_status
-        res = fn(_token(account), sale["request_id"])
+        token = _token(account)
+        if kind == "electricity":
+            res = simcloud.electricity_status(token, sale["reference"])
+            new = _status_word(res.get("status"))
+            details = _electricity_details(res, (sale.get("details") or {}).get("meter_number") or "")
+            if details["tokens"]:
+                changes["details"] = details
+        elif kind == "voucher":
+            res = simcloud.voucher_status(token, sale["request_id"])
+            new = _status_word(res.get("process_status"), res.get("status"))
+            if res.get("vouchers"):
+                changes["details"] = {**(sale.get("details") or {}), "vouchers": res["vouchers"]}
+        else:
+            fn = simcloud.airtime_status if kind == "airtime" else simcloud.data_status
+            res = fn(token, sale["request_id"])
+            new = _status_word(res.get("status"), res.get("queue_status"))
     except SimcloudError:
         return sale
-    new = str(res.get("status") or res.get("queue_status") or "").lower()
     if new and new != sale.get("status"):
-        supa.table("airtime_sales").update({"status": new, "updated_at": _now()}).eq("id", sale["id"]).eq("store_id", sale["store_id"]).execute()
-        sale = {**sale, "status": new}
+        changes["status"] = new
+    if changes:
+        supa.table("airtime_sales").update({**changes, "updated_at": _now()}).eq("id", sale["id"]).eq("store_id", sale["store_id"]).execute()
+        sale = {**sale, **changes}
     return sale
 
 

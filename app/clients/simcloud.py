@@ -128,3 +128,48 @@ def order_data(token: str, *, msisdn: str, network: str, amount, reference: str)
 
 def data_status(token: str, request_id) -> dict:
     return _request("GET", "data.php", token, params={"request_id": request_id})
+
+
+# --- Prepaid electricity ----------------------------------------------------
+
+ELECTRICITY_MIN = 55
+ELECTRICITY_MAX = 1000
+
+
+def electricity_fee(amount: int) -> int:
+    """SIMcloud's own fee, taken out of the amount: 3/103 of it, capped at
+    R10, rounded down to a whole rand. R150 buys R146 of electricity."""
+    return min(10, int(amount * 3 / 103))
+
+
+def electricity_meter(token: str, meter_number: str) -> dict:
+    """{status: success|unsupported|unknown, supported, provider}. Free."""
+    return _request("GET", "electricity.php", token, params={"meter_number": meter_number})
+
+
+def order_electricity(token: str, *, meter_number: str, amount: int, client_reference: str, recipient: str) -> dict:
+    """Buy a token. `client_reference` makes it safe to repeat: the same
+    reference returns the first result and never buys twice. May answer
+    'pending' (HTTP 202): then poll, never re-buy with a new reference."""
+    return _request(
+        "POST", "electricity.php", token,
+        json={"meter_number": meter_number, "amount": amount, "client_reference": client_reference, "recipient": recipient, "send_sms": True},
+    )
+
+
+def electricity_status(token: str, client_reference: str) -> dict:
+    return _request("GET", "electricity.php", token, params={"client_reference": client_reference})
+
+
+# --- Gift vouchers ----------------------------------------------------------
+
+def voucher_catalog(token: str) -> list:
+    return _request("GET", "vas.php", token).get("products") or []
+
+
+def order_voucher(token: str, *, product_id: int, amount, reference: str) -> dict:
+    return _request("POST", "vas.php", token, json={"product_id": product_id, "amount": amount, "reference": reference})
+
+
+def voucher_status(token: str, order_id) -> dict:
+    return _request("GET", "vas.php", token, params={"order_id": order_id})
