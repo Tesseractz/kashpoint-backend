@@ -104,6 +104,14 @@ def airtime_status(token: str, request_id) -> dict:
     return _request("GET", "airtime.php", token, params={"request_id": request_id})
 
 
+def lookup_network(token: str, msisdn: str) -> Optional[str]:
+    """Which network a number is on now (ported numbers included), as one of
+    AIRTIME_NETWORKS, or None when SIMcloud doesn't know."""
+    res = _request("GET", "network.php", token, params={"msisdn": msisdn})
+    name = re.sub(r"[^a-z]", "", str(res.get("network") or "").lower())
+    return name if name in AIRTIME_NETWORKS else None
+
+
 def data_products(token: str, network: Optional[str] = None) -> list:
     params = {"products": 1}
     if network:

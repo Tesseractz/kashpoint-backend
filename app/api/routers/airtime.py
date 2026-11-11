@@ -196,6 +196,42 @@ def settings(body: SettingsBody, ctx: RequestContext = Depends(get_current_conte
     return {"service_fee": fee}
 
 
+@router.delete("/account")
+def switch_off(ctx: RequestContext = Depends(get_current_context)):
+    """Disconnect the shop from its airtime wallet. Owner only.
+
+    SIMcloud has no way to delete an account through its API, so the wallet
+    (and any money in it) stays at SIMcloud; KashPoint just forgets the link
+    and the token. Switching on again with the same cell number reconnects
+    the same wallet. Past airtime sales stay in the shop's history.
+    """
+    _admin(ctx)
+    supa = supabase_client.get_supabase_client()
+    account = _require_account(supa, ctx.store_id)
+    balance_left = None
+    try:
+        balance_left = float(simcloud.balance(_token(account)).get("balance") or 0)
+    except SimcloudError:
+        pass
+    supa.table("airtime_accounts").delete().eq("store_id", ctx.store_id).execute()
+    return {"switched_off": True, "cell": account.get("cell"), "balance_left": balance_left}
+
+
+@router.get("/network")
+def network(msisdn: str, ctx: RequestContext = Depends(get_current_context)):
+    """Which network a customer's number is on, so the till can pick it."""
+    cell = simcloud.normalize_cell(msisdn)
+    if not cell:
+        raise HTTPException(status_code=400, detail="Enter a valid cell number.")
+    supa = supabase_client.get_supabase_client()
+    account = _require_account(supa, ctx.store_id)
+    try:
+        return {"msisdn": cell, "network": simcloud.lookup_network(_token(account), cell)}
+    except SimcloudError:
+        # A lookup that fails must never block a sale; the cashier picks by hand.
+        return {"msisdn": cell, "network": None}
+
+
 @router.get("/products")
 def products(network: str = "", ctx: RequestContext = Depends(get_current_context)):
     """Data bundles SIMcloud sells, optionally for one network."""

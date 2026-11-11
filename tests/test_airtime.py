@@ -185,6 +185,40 @@ def test_products_lists_data_bundles(owner, db):
     assert items == [{"network": "mtn", "amount": 80.0, "description": "1GB-R80", "group": "Data Bundle"}]
 
 
+def test_network_lookup_picks_the_network_and_never_blocks(cashier, db):
+    _activate(db)
+    with patch("app.clients.simcloud._request", return_value={"status": "success", "network": "Cell C"}):
+        assert cashier.get("/airtime/network", params={"msisdn": "084 555 0000"}).json() == {"msisdn": "0845550000", "network": "cellc"}
+    with patch("app.clients.simcloud.lookup_network", side_effect=SimcloudError("down", status=502)):
+        assert cashier.get("/airtime/network", params={"msisdn": "0845550000"}).json()["network"] is None
+    assert cashier.get("/airtime/network", params={"msisdn": "12"}).status_code == 400
+
+
+def test_switch_off_forgets_the_wallet_but_keeps_sales(db):
+    from app.main import app
+
+    _activate(db)
+    db.add("airtime_sales", id=1, store_id="s1", kind="airtime", network="mtn", msisdn="0835550000", amount=10.0, service_fee=0,
+           reference="KP-a", request_id="1", status="delivered", created_at="2026-11-11T10:00:00+00:00")
+    # One login at a time: each _client() replaces who the app thinks is calling.
+    assert _client("cashier").delete("/airtime/account").status_code == 403
+    owner = _client("admin")
+    try:
+        _switch_off_as_owner(owner, db)
+    finally:
+        app.dependency_overrides.clear()
+
+
+def _switch_off_as_owner(owner, db):
+    with patch("app.clients.simcloud.balance", return_value={"balance": 12.0}):
+        res = owner.delete("/airtime/account")
+    assert res.status_code == 200
+    assert res.json() == {"switched_off": True, "cell": "0821234567", "balance_left": 12.0}
+    assert db.rows("airtime_accounts") == [] and len(db.rows("airtime_sales")) == 1
+    assert owner.get("/airtime/status").json()["activated"] is False
+    assert owner.delete("/airtime/account").status_code == 409
+
+
 def test_missing_tables_say_so(owner, db):
     del db.tables["airtime_accounts"]
     res = owner.post("/airtime/sell", json={"msisdn": "0835550000", "network": "mtn", "amount": 10})
