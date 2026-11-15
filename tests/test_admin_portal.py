@@ -489,6 +489,11 @@ class TestActions:
         assert overview["states"]["unbilled"] == 1 and overview["paying"] == 1
         assert [i["id"] for i in owner.get("/admin/stores?state=unbilled").json()["items"]] == ["s_free"]
 
+    def test_a_customer_code_without_a_subscription_is_still_not_billed(self, owner, db):
+        self._add_unbilled(db)
+        next(r for r in db.rows("subscriptions") if r["store_id"] == "s_free")["paystack_customer_code"] = "CUS_test"
+        assert owner.get("/admin/stores/s_free").json()["summary"]["subscription"]["state"] == "unbilled"
+
     def test_comp_on_a_not_billed_store_really_ends(self, owner, db):
         self._add_unbilled(db)
         res = owner.post("/admin/stores/s_free/comp", json={"months": 1})

@@ -253,15 +253,15 @@ STATE_LABELS = {
 
 
 def is_unbilled(row: Optional[dict]) -> bool:
-    """Pro marked active with nothing behind it: no Paystack customer, no
-    subscription, no paid-through date. Only a hand-edited row looks like
-    this, and PlanLimits keeps it on Pro forever because nothing expires it."""
+    """Pro marked active with no Paystack subscription and no paid-through
+    date: nothing renews it, nothing ends it, and PlanLimits keeps it on Pro
+    forever. A Paystack customer code alone proves nothing; the live data has
+    test-mode customers from local runs against the shared database."""
     row = row or {}
     return (
         (row.get("status") or "").lower() == "active"
         and row.get("plan") in ("pro", "business")
         and not row.get("paystack_subscription_code")
-        and not row.get("paystack_customer_code")
         and not row.get("current_period_end")
     )
 
