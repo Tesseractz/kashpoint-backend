@@ -243,12 +243,27 @@ STATE_LABELS = {
     "trial": "On trial",
     "trial_ending": "Trial ending",
     "active": "Paying",
+    "unbilled": "Free, not billed",
     "past_due": "Payment failed",
     "trial_ended": "Trial ended",
     "canceled": "Canceled",
     "expired": "Expired",
     "none": "No subscription",
 }
+
+
+def is_unbilled(row: Optional[dict]) -> bool:
+    """Pro marked active with nothing behind it: no Paystack customer, no
+    subscription, no paid-through date. Only a hand-edited row looks like
+    this, and PlanLimits keeps it on Pro forever because nothing expires it."""
+    row = row or {}
+    return (
+        (row.get("status") or "").lower() == "active"
+        and row.get("plan") in ("pro", "business")
+        and not row.get("paystack_subscription_code")
+        and not row.get("paystack_customer_code")
+        and not row.get("current_period_end")
+    )
 
 
 def describe_subscription(row: Optional[dict], now: Optional[datetime] = None) -> dict:
@@ -278,7 +293,7 @@ def describe_subscription(row: Optional[dict], now: Optional[datetime] = None) -
     elif status == "past_due":
         state = "past_due"
     elif limits.is_active:
-        state = "active"
+        state = "unbilled" if is_unbilled(row) else "active"
     elif status == "trialing" and trial_end and trial_end <= now:
         state = "trial_ended"
     elif status == "canceled":

@@ -474,6 +474,40 @@ class TestActions:
         assert res.json()["summary"]["state"] == "trial_ended"
         assert not subscriptions.get_store_plan("s_ended").is_active
 
+    def _add_unbilled(self, db):
+        db.add("stores", id="s_free", name="Hand-set Pro", owner_id="u9", created_at=days(-80), partner_id=None)
+        db.add("profiles", id="u9", name="Owner Nine", role="admin", store_id="s_free")
+        db.add("subscriptions", store_id="s_free", plan="pro", status="active", trial_end=None, current_period_end=None,
+               paystack_subscription_code=None, paystack_customer_code=None)
+
+    def test_hand_set_pro_shows_as_not_billed_not_paying(self, owner, db):
+        self._add_unbilled(db)
+        sub = owner.get("/admin/stores/s_free").json()["summary"]["subscription"]
+        assert sub["state"] == "unbilled" and sub["label"] == "Free, not billed"
+        assert sub["paying"] is False and sub["is_active"] is True
+        overview = owner.get("/admin/overview").json()
+        assert overview["states"]["unbilled"] == 1 and overview["paying"] == 1
+        assert [i["id"] for i in owner.get("/admin/stores?state=unbilled").json()["items"]] == ["s_free"]
+
+    def test_comp_on_a_not_billed_store_really_ends(self, owner, db):
+        self._add_unbilled(db)
+        res = owner.post("/admin/stores/s_free/comp", json={"months": 1})
+        assert res.status_code == 200, res.text
+        assert res.json()["summary"]["state"] == "comped" and "free plan" in res.json()["note"]
+        row = next(r for r in db.rows("subscriptions") if r["store_id"] == "s_free")
+        assert row["status"] == "canceled"
+        row["comp_until"] = days(-1)
+        assert not subscriptions.get_store_plan("s_free").is_active
+
+    def test_extend_trial_puts_a_not_billed_store_on_the_normal_path(self, owner, db):
+        self._add_unbilled(db)
+        res = owner.post("/admin/stores/s_free/trial", json={"days": 14})
+        assert res.status_code == 200, res.text
+        assert res.json()["summary"]["state"] == "trial"
+        row = next(r for r in db.rows("subscriptions") if r["store_id"] == "s_free")
+        row["trial_end"] = days(-1)
+        assert not subscriptions.get_store_plan("s_free").is_active
+
     def test_comp_by_months_and_bad_dates(self, owner):
         res = owner.post("/admin/stores/s_trial/comp", json={"months": 2})
         assert res.status_code == 200

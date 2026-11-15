@@ -244,7 +244,7 @@ def overview(admin: PlatformAdmin = Depends(get_platform_admin)):
     cutoff = now - timedelta(days=AT_RISK_DAYS)
     at_risk = []
     for i in items:
-        if i["subscription"]["state"] not in ("trial", "trial_ending", "active", "comped"):
+        if i["subscription"]["state"] not in ("trial", "trial_ending", "active", "unbilled", "comped"):
             continue
         c = created(i)
         if not c or c > cutoff:
@@ -440,11 +440,24 @@ def grant_comp(store_id: str, body: CompBody, admin: PlatformAdmin = Depends(get
     require_owner(admin)
     supa = supabase_client.get_supabase_client()
     _load_store(supa, admin, store_id)
-    _ensure_sub(supa, store_id)
+    sub = _ensure_sub(supa, store_id)
     until = _comp_until(body)
-    updated = _update_sub(supa, store_id, {"comp_until": _iso(until)})
-    pa.log_admin_action(supa, admin, "comp.grant", store_id=store_id, details={"until": _iso(until), "reason": body.reason})
-    return {"ok": True, "comp_until": _iso(until), "summary": pa.describe_subscription(updated)}
+    payload = {"comp_until": _iso(until)}
+    note = None
+    if pa.is_unbilled(sub):
+        # Left "active", the store would fall back to unbilled Pro forever
+        # when the free period ends; canceled makes it actually end.
+        payload["status"] = "canceled"
+        note = (
+            f"This store had Pro with no billing and no end date. It now has Pro until "
+            f"{until.date().isoformat()}, then the free plan unless it subscribes on the Billing page."
+        )
+    updated = _update_sub(supa, store_id, payload)
+    pa.log_admin_action(
+        supa, admin, "comp.grant", store_id=store_id,
+        details={"until": _iso(until), "reason": body.reason, **({"was_unbilled": True} if note else {})},
+    )
+    return {"ok": True, "comp_until": _iso(until), "note": note, "summary": pa.describe_subscription(updated)}
 
 
 @router.delete("/stores/{store_id}/comp")
