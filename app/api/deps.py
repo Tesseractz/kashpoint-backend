@@ -65,6 +65,21 @@ def _partner_id_for_code(supa, code) -> Optional[str]:
     return None
 
 
+_ACQUISITION_KEYS = ("utm_source", "utm_medium", "utm_campaign")
+
+
+def _acquisition_from_metadata(raw) -> Optional[dict]:
+    """Keep only the ad/group tags a sign-up sent, as short strings."""
+    if not isinstance(raw, dict):
+        return None
+    out = {}
+    for key in _ACQUISITION_KEYS:
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            out[key] = value.strip()[:100]
+    return out or None
+
+
 def _create_store_and_profile(supa, user_id: str, user_metadata: dict) -> dict:
     """Create — or finish creating — the store, profile and trial subscription
     of a new account.
@@ -85,6 +100,9 @@ def _create_store_and_profile(supa, user_id: str, user_metadata: dict) -> dict:
     partner_id = _partner_id_for_code(supa, user_metadata.get("partner_code"))
     if partner_id:
         store_payload["partner_id"] = partner_id
+    acquisition = _acquisition_from_metadata(user_metadata.get("acquisition"))
+    if acquisition:
+        store_payload["acquisition"] = acquisition
 
     def find_store() -> Optional[str]:
         res = (
